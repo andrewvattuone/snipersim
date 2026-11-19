@@ -89,6 +89,30 @@ DramDirectoryCache::getDirectoryEntry(IntPtr address, bool modeled)
    return (DirectoryEntry*) NULL;
 }
 
+DirectoryEntry*
+DramDirectoryCache::peekDirectoryEntry(IntPtr address)
+{
+   // Same search as getDirectoryEntry(), minus the free-entry allocation and timing
+   IntPtr tag;
+   UInt32 set_index;
+   splitAddress(address, tag, set_index);
+
+   for (UInt32 i = 0; i < m_associativity; i++)
+   {
+      DirectoryEntry* directory_entry = m_directory->getDirectoryEntry(set_index * m_associativity + i);
+      if (directory_entry->getAddress() == address)
+         return directory_entry;
+   }
+
+   for (std::vector<DirectoryEntry*>::iterator it = m_replaced_directory_entry_list.begin(); it != m_replaced_directory_entry_list.end(); it++)
+   {
+      if ((*it)->getAddress() == address)
+         return (*it);
+   }
+
+   return NULL;
+}
+
 void
 DramDirectoryCache::getReplacementCandidates(IntPtr address, std::vector<DirectoryEntry*>& replacement_candidate_list)
 {

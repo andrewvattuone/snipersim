@@ -48,6 +48,8 @@ namespace PrL1PrL2DramDirectoryMSI
          ~DramDirectoryCache();
 
          DirectoryEntry* getDirectoryEntry(IntPtr address, bool modeled = false);
+         // Side-effect-free lookup (no allocation, no timing); NULL if no entry exists
+         DirectoryEntry* peekDirectoryEntry(IntPtr address);
          DirectoryEntry* replaceDirectoryEntry(IntPtr replaced_address, IntPtr address, bool modeled);
          void invalidateDirectoryEntry(IntPtr address);
          void getReplacementCandidates(IntPtr address, std::vector<DirectoryEntry*>& replacement_candidate_list);

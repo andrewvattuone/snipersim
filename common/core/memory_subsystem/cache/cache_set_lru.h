@@ -42,7 +42,61 @@ class CacheSetInfoLRU : public CacheSetInfo
                break;
          }
       }
+      // ORACLE instrumentation: sharer counts of actual eviction victims
+      static const UInt32 ORACLE_SHARER_BUCKETS = 5; // 0, 1, 2, 3, 4+
+      void recordVictimSharers(const OracleSharerInfo &info)
+      {
+         recordSharers(info.dir_status, info.dir_sharers, m_oracle_dir_sharers, &m_oracle_dir_missing, m_oracle_dir_unavailable);
+         recordSharers(info.upper_status, info.upper_sharers, m_oracle_upper_sharers, NULL /* never NOT_FOUND */, m_oracle_upper_unavailable);
+         recordCachedLocs(info);
+      }
    private:
+      // Local presence bitmap (m_cached_locs) vs. oracle probe of the same block
+      void recordCachedLocs(const OracleSharerInfo &info)
+      {
+         if (info.cv_status != OracleSharerInfo::OK)
+         {
+            ++m_cv_unavailable;
+            return;
+         }
+         ++m_cv_compared;
+         if (info.cv_mask == info.probe_mask)
+            ++m_cv_match;
+         else
+            ++m_cv_mismatch;
+         if (info.cv_mask & ~info.probe_mask)
+            ++m_cv_stale;   // bit set, but that cache does not hold the line
+         if (info.probe_mask & ~info.cv_mask)
+            ++m_cv_missing; // cache holds the line, but its bit is clear
+         // Per-core count, comparable to oracle-victim-upper-sharers (shared caches only)
+         if (info.upper_status == OracleSharerInfo::OK)
+         {
+            ++m_cv_sharers[info.cv_sharers < ORACLE_SHARER_BUCKETS ? info.cv_sharers : ORACLE_SHARER_BUCKETS - 1];
+            if (info.cv_sharers == info.upper_sharers)
+               ++m_cv_count_match;
+            else
+               ++m_cv_count_mismatch;
+         }
+      }
+
+      static void recordSharers(OracleSharerInfo::status_t status, UInt32 count,
+                                UInt64 *buckets, UInt64 *missing, UInt64 &unavailable)
+      {
+         switch (status)
+         {
+            case OracleSharerInfo::OK:
+               ++buckets[count < ORACLE_SHARER_BUCKETS ? count : ORACLE_SHARER_BUCKETS - 1];
+               break;
+            case OracleSharerInfo::NOT_FOUND:
+               LOG_ASSERT_ERROR(missing != NULL, "Unexpected NOT_FOUND oracle sharer status");
+               ++*missing;
+               break;
+            default:
+               ++unavailable;
+               break;
+         }
+      }
+
       const UInt32 m_associativity;
       UInt64* m_access;
       UInt64* m_attempts;
@@ -52,6 +106,17 @@ class CacheSetInfoLRU : public CacheSetInfo
       UInt64 m_victim_exclusive = 0;
       UInt64 m_victim_shared = 0;
       UInt64 m_victim_other = 0;
+
+      UInt64 m_oracle_dir_sharers[ORACLE_SHARER_BUCKETS] = {};
+      UInt64 m_oracle_dir_missing = 0;
+      UInt64 m_oracle_dir_unavailable = 0;
+      UInt64 m_oracle_upper_sharers[ORACLE_SHARER_BUCKETS] = {};
+      UInt64 m_oracle_upper_unavailable = 0;
+
+      UInt64 m_cv_compared = 0, m_cv_match = 0, m_cv_mismatch = 0;
+      UInt64 m_cv_stale = 0, m_cv_missing = 0, m_cv_unavailable = 0;
+      UInt64 m_cv_sharers[ORACLE_SHARER_BUCKETS] = {};
+      UInt64 m_cv_count_match = 0, m_cv_count_mismatch = 0;
 };
 
 class CacheSetLRU : public CacheSet

@@ -132,11 +132,51 @@ public:
 	int getReuse() { return m_reuse; }
 };
 
+// ORACLE sharer information for one cache line, for diagnostics only.
+// It is obtained by reading simulator state directly (no modeled messages,
+// latency or energy), so a hardware-realistic replacement policy must not
+// base decisions on it.
+struct OracleSharerInfo
+{
+	enum status_t
+	{
+		UNAVAILABLE, // no query possible (no controller, no directory, not applicable)
+		NOT_FOUND,   // query performed, but the directory holds no entry for this line
+		OK           // query performed, count is valid (may be genuinely zero)
+	};
+
+	// Directory view: number of last-level-cache instances (identified by
+	// their master core id) that the home directory lists as sharers.
+	status_t dir_status;
+	UInt32 dir_sharers;
+
+	// Shared-cache view: number of distinct cores whose private caches,
+	// directly above this (shared) cache, hold the line.
+	status_t upper_status;
+	UInt32 upper_sharers;
+
+	// Validation of the cache's own presence bitmap (m_cached_locs, only with
+	// ENABLE_TRACK_SHARING_PREVCACHES). Bit i stands for the i-th previous-level
+	// cache. cv_mask is what the cache tracks locally; probe_mask is what an
+	// oracle probe of those caches finds. cv_sharers = distinct cores in cv_mask.
+	status_t cv_status; // OK or UNAVAILABLE
+	UInt32 cv_mask;
+	UInt32 probe_mask;
+	UInt32 cv_sharers;
+
+	OracleSharerInfo()
+		: dir_status(UNAVAILABLE), dir_sharers(0), upper_status(UNAVAILABLE), upper_sharers(0)
+		, cv_status(UNAVAILABLE), cv_mask(0), probe_mask(0), cv_sharers(0)
+	{}
+};
+
 class CacheCntlr
 {
 public:
 	virtual bool isInLowerLevelCache(CacheBlockInfo *block_info) { return false; }
 	virtual void incrementQBSLookupCost() {}
+	// Observation-only oracle query; can be called for any valid block in a set.
+	virtual OracleSharerInfo queryOracleSharers(CacheBlockInfo *block_info) { return OracleSharerInfo(); }
 };
 
 #endif /* __CACHE_BLOCK_INFO_H__ */

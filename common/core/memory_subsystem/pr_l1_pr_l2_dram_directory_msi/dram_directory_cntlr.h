@@ -10,6 +10,7 @@
 #include "mem_component.h"
 #include "memory_manager_base.h"
 #include "coherency_protocol.h"
+#include "lock.h"
 
 class NucaCache;
 
@@ -87,6 +88,16 @@ namespace PrL1PrL2DramDirectoryMSI
          void handleMsgFromDRAM(core_id_t sender, ShmemMsg* shmem_msg);
 
          DramDirectoryCache* getDramDirectoryCache() { return m_dram_directory_cache; }
+
+         // ORACLE diagnostic read of the sharer count, safe to call from any thread.
+         // Returns false if the directory holds no entry for this (line-aligned) address.
+         bool oracleGetNumSharers(IntPtr address, UInt32 &num_sharers);
+
+      private:
+         // Serializes the handlers (which run on this core's sim thread) against
+         // oracleGetNumSharers() callers on other threads. Host-side only: it
+         // changes no coherence state, message or simulated timing.
+         Lock m_oracle_lock;
    };
 
 }

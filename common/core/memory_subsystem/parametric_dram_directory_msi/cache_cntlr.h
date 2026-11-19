@@ -583,6 +583,7 @@ namespace ParametricDramDirectoryMSI
 
          bool isInLowerLevelCache(CacheBlockInfo *block_info);
          void incrementQBSLookupCost();
+         OracleSharerInfo queryOracleSharers(CacheBlockInfo *block_info);
 
          void enable() { m_master->m_cache->enable(); }
          void disable() { m_master->m_cache->disable(); }

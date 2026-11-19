@@ -213,6 +213,7 @@
 #include "cache_atd.h"
 #include "shmem_perf.h"
 #include <cstring>
+#include <algorithm>
 
 // Define to allow private L2 caches not to take the stack lock.
 // Works in most cases, but seems to have some more bugs or race conditions, preventing it from being ready for prime time.
@@ -2517,6 +2518,91 @@ namespace ParametricDramDirectoryMSI
 				return true;
 		}
 		return false;
+	}
+
+	/*
+	 * ORACLE sharer query (diagnostics only).
+	 * Reads simulator state directly; it sends no message, charges no latency
+	 * and changes no coherence or replacement state.
+	 */
+	OracleSharerInfo
+	CacheCntlr::queryOracleSharers(CacheBlockInfo *block_info)
+	{
+		OracleSharerInfo info;
+		if (block_info == NULL || !block_info->isValid())
+			return info;
+
+		// tag == address >> log2(blocksize), so this is the exact line address
+		// regardless of the set-index hash.
+		IntPtr address = m_master->m_cache->tagToAddress(block_info->getTag());
+
+		// Directory view: the home directory tracks sharers per LLC master core
+		core_id_t home = getHome(address);
+		MemoryManager *home_mm = static_cast<MemoryManager *>(Sim()->getCoreManager()->getCoreFromID(home)->getMemoryManager());
+		PrL1PrL2DramDirectoryMSI::DramDirectoryCntlr *dir_cntlr = home_mm->getDramDirectoryCntlr();
+		if (dir_cntlr != NULL) // NULL e.g. with perf_model/dram/direct_access
+		{
+			UInt32 num_sharers = 0;
+			if (dir_cntlr->oracleGetNumSharers(address, num_sharers))
+			{
+				info.dir_status = OracleSharerInfo::OK;
+				info.dir_sharers = num_sharers;
+			}
+			else
+				info.dir_status = OracleSharerInfo::NOT_FOUND;
+		}
+
+		// Shared-cache view: distinct cores whose private caches directly above
+		// this shared cache hold the line. Same probe as isInLowerLevelCache()
+		// (QBS); all levels are inclusive, so the next-higher level suffices and
+		// L1/L2 copies of one core are never counted twice.
+		// The same probe also records which previous-level caches hold the line
+		// (bit i = m_prev_cache_cntlrs[i]), at every level that has any.
+		const CacheCntlrList &prev = m_master->m_prev_cache_cntlrs;
+		UInt32 probe_mask = 0;
+		std::vector<core_id_t> cores;
+		for (UInt32 idx = 0; idx < prev.size(); ++idx)
+		{
+			if (prev[idx]->getCacheBlockInfo(address) != NULL)
+			{
+				probe_mask |= 1u << idx; // prev.size() <= MAX_NUM_PREVCACHES (8), asserted at setup
+				if (std::find(cores.begin(), cores.end(), prev[idx]->m_core_id) == cores.end())
+					cores.push_back(prev[idx]->m_core_id);
+			}
+		}
+		if (m_shared_cores > 1 && !prev.empty())
+		{
+			info.upper_status = OracleSharerInfo::OK;
+			info.upper_sharers = cores.size();
+		}
+
+#ifdef ENABLE_TRACK_SHARING_PREVCACHES
+		// Validation of the locally tracked presence bitmap against the probe
+		if (!prev.empty())
+		{
+			info.cv_status = OracleSharerInfo::OK;
+			info.cv_mask = static_cast<SharedCacheBlockInfo *>(block_info)->getCachedLocs().to_ulong();
+			info.probe_mask = probe_mask;
+			std::vector<core_id_t> cv_cores;
+			for (UInt32 idx = 0; idx < prev.size(); ++idx)
+				if ((info.cv_mask & (1u << idx))
+					&& std::find(cv_cores.begin(), cv_cores.end(), prev[idx]->m_core_id) == cv_cores.end())
+					cv_cores.push_back(prev[idx]->m_core_id);
+			info.cv_sharers = cv_cores.size();
+
+			if (info.cv_mask != info.probe_mask)
+			{
+				// Counted in cachedlocs-victim-mismatch; also report the first few in detail
+				static UInt32 num_reported = 0;
+				if (__sync_fetch_and_add(&num_reported, 1) < 20)
+					fprintf(stderr, "[CACHEDLOCS MISMATCH] %s core %d addr %lx state %c cached_locs %#x probe %#x\n",
+						MemComponentString(m_mem_component), m_core_id, address,
+						CStateString(block_info->getCState()), info.cv_mask, info.probe_mask);
+			}
+		}
+#endif
+
+		return info;
 	}
 
 	void

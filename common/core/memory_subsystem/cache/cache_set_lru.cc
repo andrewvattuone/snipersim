@@ -74,6 +74,10 @@ CacheSetLRU::getReplacementIndex(CacheCntlr *cntlr)
          // Record which MESI state was evicted
          m_set_info->recordVictimState(state);
 
+         // ORACLE instrumentation (observation only, does not affect the choice)
+         m_set_info->recordVictimSharers(
+            (cntlr && !m_is_tlb_set) ? cntlr->queryOracleSharers(m_cache_block_info_array[index]) : OracleSharerInfo());
+
          // Preserve the original LRU replacement behavior
          moveToMRU(index);
          m_set_info->incrementAttempt(attempt);
@@ -128,6 +132,27 @@ CacheSetInfoLRU::CacheSetInfoLRU(String name, String cfgname, core_id_t core_id,
    registerStatsMetric(name, core_id, "lru-victim-E", &m_victim_exclusive);
    registerStatsMetric(name, core_id, "lru-victim-S", &m_victim_shared);
    registerStatsMetric(name, core_id, "lru-victim-other", &m_victim_other);
+
+   // ORACLE sharer counts of LRU victims (direct simulator-state reads, unmodeled)
+   for (UInt32 i = 0; i < ORACLE_SHARER_BUCKETS; ++i)
+   {
+      String bucket = (i == ORACLE_SHARER_BUCKETS - 1) ? itostr(i) + "plus" : itostr(i);
+      registerStatsMetric(name, core_id, "oracle-victim-dir-sharers-" + bucket, &m_oracle_dir_sharers[i]);
+      registerStatsMetric(name, core_id, "oracle-victim-upper-sharers-" + bucket, &m_oracle_upper_sharers[i]);
+      registerStatsMetric(name, core_id, "cachedlocs-victim-sharers-" + bucket, &m_cv_sharers[i]);
+   }
+   // Local presence bitmap (m_cached_locs) checked against the oracle probe
+   registerStatsMetric(name, core_id, "cachedlocs-victim-compared", &m_cv_compared);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-match", &m_cv_match);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-mismatch", &m_cv_mismatch);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-stale", &m_cv_stale);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-missing", &m_cv_missing);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-unavailable", &m_cv_unavailable);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-count-match", &m_cv_count_match);
+   registerStatsMetric(name, core_id, "cachedlocs-victim-count-mismatch", &m_cv_count_mismatch);
+   registerStatsMetric(name, core_id, "oracle-victim-dir-missing", &m_oracle_dir_missing);
+   registerStatsMetric(name, core_id, "oracle-victim-dir-unavailable", &m_oracle_dir_unavailable);
+   registerStatsMetric(name, core_id, "oracle-victim-upper-unavailable", &m_oracle_upper_unavailable);
 };
 
 CacheSetInfoLRU::~CacheSetInfoLRU()

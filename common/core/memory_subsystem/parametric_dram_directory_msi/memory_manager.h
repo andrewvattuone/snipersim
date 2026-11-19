@@ -115,6 +115,7 @@ namespace ParametricDramDirectoryMSI
 		Cache *getL1DCache() { return getCache(MemComponent::L1_DCACHE); }
 		Cache *getLastLevelCache() { return getCache(MemComponent::LAST_LEVEL_CACHE); }
 		PrL1PrL2DramDirectoryMSI::DramDirectoryCache *getDramDirectoryCache() { return m_dram_directory_cntlr->getDramDirectoryCache(); }
+		PrL1PrL2DramDirectoryMSI::DramDirectoryCntlr *getDramDirectoryCntlr() { return m_dram_directory_cntlr; } // NULL if this core hosts no directory
 		PrL1PrL2DramDirectoryMSI::DramCntlr *getDramCntlr() { return m_dram_cntlr; }
 		AddressHomeLookup *getTagDirectoryHomeLookup() { return m_tag_directory_home_lookup; }
 		AddressHomeLookup *getDramControllerHomeLookup() { return m_dram_controller_home_lookup; }

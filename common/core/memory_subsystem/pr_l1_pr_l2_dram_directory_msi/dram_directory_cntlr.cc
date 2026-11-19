@@ -102,6 +102,7 @@ DramDirectoryCntlr::~DramDirectoryCntlr()
 void
 DramDirectoryCntlr::handleMsgFromL2Cache(core_id_t sender, ShmemMsg* shmem_msg)
 {
+   ScopedLock sl_oracle(m_oracle_lock); // oracle instrumentation only, see oracleGetNumSharers()
    ShmemMsg::msg_t shmem_msg_type = shmem_msg->getMsgType();
    SubsecondTime msg_time = getShmemPerfModel()->getElapsedTime(ShmemPerfModel::_SIM_THREAD);
    IntPtr address = shmem_msg->getAddress();
@@ -197,9 +198,21 @@ DramDirectoryCntlr::handleMsgFromL2Cache(core_id_t sender, ShmemMsg* shmem_msg)
 MYLOG("done for %lx", address);
 }
 
+bool
+DramDirectoryCntlr::oracleGetNumSharers(IntPtr address, UInt32 &num_sharers)
+{
+   ScopedLock sl_oracle(m_oracle_lock);
+   DirectoryEntry* directory_entry = m_dram_directory_cache->peekDirectoryEntry(address);
+   if (directory_entry == NULL)
+      return false;
+   num_sharers = directory_entry->getNumSharers();
+   return true;
+}
+
 void
 DramDirectoryCntlr::handleMsgFromDRAM(core_id_t sender, ShmemMsg* shmem_msg)
 {
+   ScopedLock sl_oracle(m_oracle_lock); // oracle instrumentation only, see oracleGetNumSharers()
    MYLOG("Start");
    ShmemMsg::msg_t shmem_msg_type = shmem_msg->getMsgType();
 
