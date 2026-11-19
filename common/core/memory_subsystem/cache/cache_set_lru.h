@@ -20,10 +20,38 @@ class CacheSetInfoLRU : public CacheSetInfo
          else
             LOG_ASSERT_ERROR(attempt == 0, "No place to store attempt# histogram but attempt != 0");
       }
+
+      void recordVictimState(CacheState::cstate_t state)
+      {
+         switch (state)
+         {
+            case CacheState::MODIFIED:
+               ++m_victim_modified;
+               break;
+
+            case CacheState::EXCLUSIVE:
+               ++m_victim_exclusive;
+               break;
+
+            case CacheState::SHARED:
+               ++m_victim_shared;
+               break;
+
+            default:
+               ++m_victim_other;
+               break;
+         }
+      }
    private:
       const UInt32 m_associativity;
       UInt64* m_access;
       UInt64* m_attempts;
+
+       // Count eviction victims by coherence state
+      UInt64 m_victim_modified = 0;
+      UInt64 m_victim_exclusive = 0;
+      UInt64 m_victim_shared = 0;
+      UInt64 m_victim_other = 0;
 };
 
 class CacheSetLRU : public CacheSet

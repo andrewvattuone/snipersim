@@ -67,7 +67,14 @@ CacheSetLRU::getReplacementIndex(CacheCntlr *cntlr)
       }
       else
       {
-         // Mark our newly-inserted line as most-recently used
+         // Get the coherence state of the selected victim
+         CacheState::cstate_t state =
+            m_cache_block_info_array[index]->getCState();
+
+         // Record which MESI state was evicted
+         m_set_info->recordVictimState(state);
+
+         // Preserve the original LRU replacement behavior
          moveToMRU(index);
          m_set_info->incrementAttempt(attempt);
          return index;
@@ -115,6 +122,12 @@ CacheSetInfoLRU::CacheSetInfoLRU(String name, String cfgname, core_id_t core_id,
          registerStatsMetric(name, core_id, String("qbs-attempt-")+itostr(i), &m_attempts[i]);
       }
    }
+
+   // Register coherence-state victim counters
+   registerStatsMetric(name, core_id, "lru-victim-M", &m_victim_modified);
+   registerStatsMetric(name, core_id, "lru-victim-E", &m_victim_exclusive);
+   registerStatsMetric(name, core_id, "lru-victim-S", &m_victim_shared);
+   registerStatsMetric(name, core_id, "lru-victim-other", &m_victim_other);
 };
 
 CacheSetInfoLRU::~CacheSetInfoLRU()
