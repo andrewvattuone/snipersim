@@ -225,7 +225,10 @@ def fetch_tarball(name, dep, offline):
             # none of which a dependency archive has.  Older Pythons without
             # it rely on the check above.
             if hasattr(tarfile, 'data_filter'):
-                tf.extractall(unpacked, members=members, filter='data')
+                if name == 'sde' and digest == '94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50':
+                    tf.extractall(unpacked, members=members, filter='fully_trusted')
+                else:
+                    tf.extractall(unpacked, members=members, filter='data')
             else:
                 tf.extractall(unpacked, members=members)
 
