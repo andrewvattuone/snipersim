@@ -317,6 +317,12 @@ namespace ParametricDramDirectoryMSI
            UInt64 spec_evict_total;    // L2 evictions caused by speculative prefetches
            UInt64 spec_evict_harmful;  // of those, demand misses within access window
            UInt64 coherency_downgrades, coherency_upgrades, coherency_invalidates, coherency_writebacks;
+           // Delivered sharer hint (private cache below a shared one), see copyDataFromNextLevel()
+           UInt64 sharer_hint_fills, sharer_hint_fills_write;
+           UInt64 sharer_hint_fill[4];                    // delivered value 1, 2, 3, 4+
+           UInt64 sharer_hint_write_with_sharers;         // write fill while others still listed (expected 0)
+           UInt64 sharer_hint_exclusive_with_sharers;     // read fill granted E/M while others hold the line
+           UInt64 sharer_hint_write_hit_resets;           // write hit on M lowered a hint > 1 to 1
            #ifdef ENABLE_TRANSITIONS
            UInt64 transitions[CacheState::NUM_CSTATE_SPECIAL_STATES][CacheState::NUM_CSTATE_SPECIAL_STATES];
            UInt64 transition_reasons[Transition::NUM_REASONS][CacheState::NUM_CSTATE_SPECIAL_STATES][CacheState::NUM_CSTATE_SPECIAL_STATES];
@@ -584,6 +590,11 @@ namespace ParametricDramDirectoryMSI
          bool isInLowerLevelCache(CacheBlockInfo *block_info);
          void incrementQBSLookupCost();
          OracleSharerInfo queryOracleSharers(CacheBlockInfo *block_info);
+         // Delivered sharer hint: does this cache receive one from the next level, and
+         // (called on that shared next level) how many cores other than `requester`
+         // its own presence bits list for the line, as reported with a fill response.
+         bool receivesSharerHint() const;
+         UInt32 countOtherSharers(IntPtr address, core_id_t requester);
 
          void enable() { m_master->m_cache->enable(); }
          void disable() { m_master->m_cache->disable(); }

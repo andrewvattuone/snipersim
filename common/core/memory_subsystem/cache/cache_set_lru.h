@@ -49,6 +49,7 @@ class CacheSetInfoLRU : public CacheSetInfo
          recordSharers(info.dir_status, info.dir_sharers, m_oracle_dir_sharers, &m_oracle_dir_missing, m_oracle_dir_unavailable);
          recordSharers(info.upper_status, info.upper_sharers, m_oracle_upper_sharers, NULL /* never NOT_FOUND */, m_oracle_upper_unavailable);
          recordCachedLocs(info);
+         recordSharerHint(info);
       }
    private:
       // Local presence bitmap (m_cached_locs) vs. oracle probe of the same block
@@ -77,6 +78,40 @@ class CacheSetInfoLRU : public CacheSetInfo
             else
                ++m_cv_count_mismatch;
          }
+      }
+
+      // Delivered sharer hint (local block metadata) vs. oracle count of holding cores
+      void recordSharerHint(const OracleSharerInfo &info)
+      {
+         if (info.hint_status == OracleSharerInfo::UNAVAILABLE)
+         {
+            ++m_hint_unavailable;
+            return;
+         }
+         if (info.hint_status == OracleSharerInfo::NOT_FOUND)
+         {
+            ++m_hint_missing;
+            return;
+         }
+         ++m_hint_compared;
+         ++m_hint_delivered[info.hint < ORACLE_SHARER_BUCKETS ? info.hint : ORACLE_SHARER_BUCKETS - 1];
+         ++m_hint_oracle[info.hint_oracle < ORACLE_SHARER_BUCKETS ? info.hint_oracle : ORACLE_SHARER_BUCKETS - 1];
+         if (info.hint == info.hint_oracle)
+            ++m_hint_exact;
+         else if (info.hint > info.hint_oracle)
+            ++m_hint_over;  // stale-high: other holders have left
+         else
+            ++m_hint_under; // stale-low: other holders joined after our fill
+         m_hint_abs_error += info.hint > info.hint_oracle ? info.hint - info.hint_oracle : info.hint_oracle - info.hint;
+         bool heavy_delivered = info.hint > info.heavy_threshold, heavy_oracle = info.hint_oracle > info.heavy_threshold;
+         if (heavy_delivered && heavy_oracle)
+            ++m_hint_heavy_both;
+         else if (heavy_delivered)
+            ++m_hint_heavy_delivered_only; // ChampSim: delivered_above_oracle_below
+         else if (heavy_oracle)
+            ++m_hint_heavy_oracle_only;    // ChampSim: delivered_below_oracle_above
+         else
+            ++m_hint_heavy_neither;
       }
 
       static void recordSharers(OracleSharerInfo::status_t status, UInt32 count,
@@ -117,6 +152,11 @@ class CacheSetInfoLRU : public CacheSetInfo
       UInt64 m_cv_stale = 0, m_cv_missing = 0, m_cv_unavailable = 0;
       UInt64 m_cv_sharers[ORACLE_SHARER_BUCKETS] = {};
       UInt64 m_cv_count_match = 0, m_cv_count_mismatch = 0;
+
+      UInt64 m_hint_compared = 0, m_hint_missing = 0, m_hint_unavailable = 0;
+      UInt64 m_hint_exact = 0, m_hint_over = 0, m_hint_under = 0, m_hint_abs_error = 0;
+      UInt64 m_hint_delivered[ORACLE_SHARER_BUCKETS] = {}, m_hint_oracle[ORACLE_SHARER_BUCKETS] = {};
+      UInt64 m_hint_heavy_both = 0, m_hint_heavy_neither = 0, m_hint_heavy_delivered_only = 0, m_hint_heavy_oracle_only = 0;
 };
 
 class CacheSetLRU : public CacheSet

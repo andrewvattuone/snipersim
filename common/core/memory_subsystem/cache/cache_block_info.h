@@ -67,6 +67,11 @@ private:
 	// access has not yet been credited for.
 	BitsUsedType m_prefetch_pending;
 	UInt8 m_options; // large enough to hold a bitfield for all available option_t's
+	// Delivered sharer hint: number of cores (including this one) that the next
+	// level reported as holding the line when this copy was obtained; 0 = none.
+	// Local, possibly stale metadata (see CacheCntlr::copyDataFromNextLevel).
+	// Occupies padding after m_options, so it does not grow the block.
+	UInt8 m_sharer_hint;
 	block_type_t m_block_type;
 	int m_reuse; // tracking reuse
 	int utilization;
@@ -130,6 +135,9 @@ public:
 
 	void increaseReuse() { m_reuse++; }
 	int getReuse() { return m_reuse; }
+
+	UInt8 getSharerHint() const { return m_sharer_hint; }
+	void setSharerHint(UInt32 hint) { m_sharer_hint = hint > 255 ? 255 : hint; }
 };
 
 // ORACLE sharer information for one cache line, for diagnostics only.
@@ -164,9 +172,19 @@ struct OracleSharerInfo
 	UInt32 probe_mask;
 	UInt32 cv_sharers;
 
+	// Delivered sharer hint of a private cache below a shared one, against the
+	// oracle count of distinct cores (including this one) currently holding the
+	// line. hint_status: UNAVAILABLE = this cache gets no hints; NOT_FOUND = it
+	// does, but this block carries none; OK = both values are valid.
+	status_t hint_status;
+	UInt32 hint;
+	UInt32 hint_oracle;
+	UInt32 heavy_threshold; // heavy sharing iff count > heavy_threshold (num_cores / 2)
+
 	OracleSharerInfo()
 		: dir_status(UNAVAILABLE), dir_sharers(0), upper_status(UNAVAILABLE), upper_sharers(0)
 		, cv_status(UNAVAILABLE), cv_mask(0), probe_mask(0), cv_sharers(0)
+		, hint_status(UNAVAILABLE), hint(0), hint_oracle(0), heavy_threshold(0)
 	{}
 };
 

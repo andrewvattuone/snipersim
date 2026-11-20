@@ -564,6 +564,13 @@ namespace ParametricDramDirectoryMSI
 		registerStatsMetric(name, core_id, "coherency-upgrades", &stats.coherency_upgrades);
 		registerStatsMetric(name, core_id, "coherency-writebacks", &stats.coherency_writebacks);
 		registerStatsMetric(name, core_id, "coherency-invalidates", &stats.coherency_invalidates);
+		registerStatsMetric(name, core_id, "sharer-hint-fills", &stats.sharer_hint_fills);
+		registerStatsMetric(name, core_id, "sharer-hint-fills-write", &stats.sharer_hint_fills_write);
+		for (UInt32 i = 0; i < 4; ++i)
+			registerStatsMetric(name, core_id, "sharer-hint-fill-" + (i == 3 ? String("4plus") : itostr(i + 1)), &stats.sharer_hint_fill[i]);
+		registerStatsMetric(name, core_id, "sharer-hint-write-with-sharers", &stats.sharer_hint_write_with_sharers);
+		registerStatsMetric(name, core_id, "sharer-hint-exclusive-with-sharers", &stats.sharer_hint_exclusive_with_sharers);
+		registerStatsMetric(name, core_id, "sharer-hint-write-hit-resets", &stats.sharer_hint_write_hit_resets);
 #ifdef ENABLE_TRANSITIONS
 		for (CacheState::cstate_t old_state = CacheState::CSTATE_FIRST; old_state < CacheState::NUM_CSTATE_STATES; old_state = CacheState::cstate_t(int(old_state) + 1))
 			for (CacheState::cstate_t new_state = CacheState::CSTATE_FIRST; new_state < CacheState::NUM_CSTATE_STATES; new_state = CacheState::cstate_t(int(new_state) + 1))
@@ -1261,6 +1268,17 @@ namespace ParametricDramDirectoryMSI
 			getMemoryManager()->incrElapsedTime(t_done - t_now - delay, ShmemPerfModel::_USER_THREAD);
 		}
 
+		// Delivered sharer hint. The shared next level reports, with this response,
+		// how many cores other than us its own presence bits list for the line; the
+		// hint counts us as well (same meaning as ChampSim's delivered_sharers). Our
+		// own bit is never set yet: our copy was invalidated before the miss was
+		// forwarded, and is only registered at the next level by the insert below.
+		// No latency is charged: a few bits ride on the response that is modeled.
+		UInt32 others = 0;
+		bool deliver_hint = receivesSharerHint();
+		if (deliver_hint)
+			others = m_next_cache_cntlr->countOtherSharers(address, m_core_id);
+
 		SharedCacheBlockInfo *cache_block_info = getCacheBlockInfo(address);
 
 		if (cache_block_info)
@@ -1276,6 +1294,23 @@ namespace ParametricDramDirectoryMSI
 			// Insert the Cache Block in our own cache
 			insertCacheBlock(address, cstate, data_buf, m_core_id, ShmemPerfModel::_USER_THREAD, block_type);
 			MYLOG("copyDataFromNextLevel l%d done (inserted)", m_mem_component);
+		}
+
+		if (deliver_hint)
+		{
+			getCacheBlockInfo(address)->setSharerHint(others + 1);
+			ScopedLock sl(getLock());
+			++stats.sharer_hint_fills;
+			++stats.sharer_hint_fill[std::min<UInt32>(others + 1, 4) - 1];
+			if (mem_op_type != Core::READ)
+			{
+				// The next level invalidated every other copy before granting ownership
+				++stats.sharer_hint_fills_write;
+				if (others > 0)
+					++stats.sharer_hint_write_with_sharers;
+			}
+			else if (others > 0 && (cstate == CacheState::EXCLUSIVE || cstate == CacheState::MODIFIED))
+				++stats.sharer_hint_exclusive_with_sharers; // our MESI state is inherited from the shared level
 		}
 	}
 
@@ -1562,6 +1597,18 @@ namespace ParametricDramDirectoryMSI
 #ifdef ENABLE_TRACK_SHARING_PREVCACHES
 				assert(!cache_block_info->hasCachedLoc());
 #endif
+				// Delivered sharer hint: writing a line held in M makes this core its
+				// sole holder as far as the protocol is concerned (ChampSim's
+				// coherence_set_modified); refreshes a stale count.
+				if (receivesSharerHint() && cache_block_info->getSharerHint() != 1)
+				{
+					if (cache_block_info->getSharerHint() > 1)
+					{
+						ScopedLock sl(getLock());
+						++stats.sharer_hint_write_hit_resets;
+					}
+					cache_block_info->setSharerHint(1);
+				}
 			}
 			else if (cache_block_info->getCState() == CacheState::MODIFIED) // reading MODIFIED data
 			{
@@ -2602,7 +2649,56 @@ namespace ParametricDramDirectoryMSI
 		}
 #endif
 
+		// Delivered sharer hint of this (private) cache against the oracle: distinct
+		// cores, this one included, whose caches directly below the shared next level
+		// hold the line now (the same probe as above, one level down).
+		if (receivesSharerHint())
+		{
+			info.heavy_threshold = Sim()->getConfig()->getApplicationCores() / 2;
+			const CacheCntlrList &peers = m_next_cache_cntlr->m_master->m_prev_cache_cntlrs;
+			std::vector<core_id_t> holders;
+			for (CacheCntlrList::const_iterator it = peers.begin(); it != peers.end(); ++it)
+				if ((*it)->getCacheBlockInfo(address) != NULL
+					&& std::find(holders.begin(), holders.end(), (*it)->m_core_id) == holders.end())
+					holders.push_back((*it)->m_core_id);
+			info.hint_oracle = holders.size();
+			info.hint = block_info->getSharerHint();
+			info.hint_status = info.hint ? OracleSharerInfo::OK : OracleSharerInfo::NOT_FOUND;
+		}
+
 		return info;
+	}
+
+	bool
+	CacheCntlr::receivesSharerHint() const
+	{
+#ifdef ENABLE_TRACK_SHARING_PREVCACHES
+		return m_next_cache_cntlr && m_next_cache_cntlr->m_shared_cores > 1 && !m_perfect;
+#else
+		return false; // the next level keeps no presence bits to report
+#endif
+	}
+
+	UInt32
+	CacheCntlr::countOtherSharers(IntPtr address, core_id_t requester)
+	{
+		// Local to this (shared) cache: its own block's presence bits, mapped to cores
+		UInt32 count = 0;
+#ifdef ENABLE_TRACK_SHARING_PREVCACHES
+		SharedCacheBlockInfo *block_info = getCacheBlockInfo(address);
+		if (block_info)
+		{
+			const CacheCntlrList &prev = m_master->m_prev_cache_cntlrs;
+			CacheSharersType locs = block_info->getCachedLocs();
+			std::vector<core_id_t> cores;
+			for (UInt32 idx = 0; idx < prev.size(); ++idx)
+				if (locs.test(idx) && prev[idx]->m_core_id != requester
+					&& std::find(cores.begin(), cores.end(), prev[idx]->m_core_id) == cores.end())
+					cores.push_back(prev[idx]->m_core_id);
+			count = cores.size();
+		}
+#endif
+		return count;
 	}
 
 	void

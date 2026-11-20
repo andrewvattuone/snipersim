@@ -31,6 +31,7 @@ CacheBlockInfo::CacheBlockInfo(IntPtr tag, CacheState::cstate_t cstate, UInt64 o
                                                                                           m_used(0),
                                                                                           m_prefetch_pending(0),
                                                                                           m_options(options),
+                                                                                          m_sharer_hint(0),
                                                                                           m_block_type(DATA),
                                                                                           m_reuse(0),
                                                                                           utilization(0)
@@ -68,6 +69,7 @@ void CacheBlockInfo::invalidate()
    m_tag = ~0;
    m_cstate = CacheState::INVALID;
    m_prefetch_pending = 0;
+   m_sharer_hint = 0;
 }
 
 void CacheBlockInfo::clone(CacheBlockInfo *cache_block_info)
@@ -77,6 +79,7 @@ void CacheBlockInfo::clone(CacheBlockInfo *cache_block_info)
    m_owner = cache_block_info->m_owner;
    m_used = cache_block_info->m_used;
    m_options = cache_block_info->m_options;
+   m_sharer_hint = cache_block_info->m_sharer_hint;
    m_block_type = cache_block_info->getBlockType();
    m_reuse = cache_block_info->getReuse();
    m_page_size = cache_block_info->getPageSize();

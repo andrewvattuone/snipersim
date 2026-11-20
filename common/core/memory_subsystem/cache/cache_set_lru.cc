@@ -140,6 +140,8 @@ CacheSetInfoLRU::CacheSetInfoLRU(String name, String cfgname, core_id_t core_id,
       registerStatsMetric(name, core_id, "oracle-victim-dir-sharers-" + bucket, &m_oracle_dir_sharers[i]);
       registerStatsMetric(name, core_id, "oracle-victim-upper-sharers-" + bucket, &m_oracle_upper_sharers[i]);
       registerStatsMetric(name, core_id, "cachedlocs-victim-sharers-" + bucket, &m_cv_sharers[i]);
+      registerStatsMetric(name, core_id, "hint-victim-delivered-" + bucket, &m_hint_delivered[i]);
+      registerStatsMetric(name, core_id, "hint-victim-oracle-" + bucket, &m_hint_oracle[i]);
    }
    // Local presence bitmap (m_cached_locs) checked against the oracle probe
    registerStatsMetric(name, core_id, "cachedlocs-victim-compared", &m_cv_compared);
@@ -150,6 +152,18 @@ CacheSetInfoLRU::CacheSetInfoLRU(String name, String cfgname, core_id_t core_id,
    registerStatsMetric(name, core_id, "cachedlocs-victim-unavailable", &m_cv_unavailable);
    registerStatsMetric(name, core_id, "cachedlocs-victim-count-match", &m_cv_count_match);
    registerStatsMetric(name, core_id, "cachedlocs-victim-count-mismatch", &m_cv_count_mismatch);
+   // Delivered sharer hint (local, possibly stale) against the oracle holder count
+   registerStatsMetric(name, core_id, "hint-victim-compared", &m_hint_compared);
+   registerStatsMetric(name, core_id, "hint-victim-missing", &m_hint_missing);
+   registerStatsMetric(name, core_id, "hint-victim-unavailable", &m_hint_unavailable);
+   registerStatsMetric(name, core_id, "hint-victim-exact", &m_hint_exact);
+   registerStatsMetric(name, core_id, "hint-victim-over", &m_hint_over);
+   registerStatsMetric(name, core_id, "hint-victim-under", &m_hint_under);
+   registerStatsMetric(name, core_id, "hint-victim-abs-error", &m_hint_abs_error);
+   registerStatsMetric(name, core_id, "hint-victim-heavy-both", &m_hint_heavy_both);
+   registerStatsMetric(name, core_id, "hint-victim-heavy-neither", &m_hint_heavy_neither);
+   registerStatsMetric(name, core_id, "hint-victim-heavy-delivered-only", &m_hint_heavy_delivered_only);
+   registerStatsMetric(name, core_id, "hint-victim-heavy-oracle-only", &m_hint_heavy_oracle_only);
    registerStatsMetric(name, core_id, "oracle-victim-dir-missing", &m_oracle_dir_missing);
    registerStatsMetric(name, core_id, "oracle-victim-dir-unavailable", &m_oracle_dir_unavailable);
    registerStatsMetric(name, core_id, "oracle-victim-upper-unavailable", &m_oracle_upper_unavailable);
