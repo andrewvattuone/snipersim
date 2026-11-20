@@ -12,8 +12,8 @@ The simulator side is in `common/core/memory_subsystem`:
 | L2 delivered sharer hint (`CacheBlockInfo::m_sharer_hint`) | set in `CacheCntlr::copyDataFromNextLevel()` | Yes: reported by the L3 with the fill |
 | `oracle-*` counts | `CacheCntlr::queryOracleSharers()` | No: direct reads of other caches, diagnostics only |
 
-Nothing here feeds a replacement decision; LRU is unchanged. The directory also holds a
-deterministic coherence regression test and notes on Sniper's tracing and checking hooks.
+Nothing here feeds a replacement decision; LRU is unchanged. The directory also holds the
+coherence regression test for the MESI fill-state fix; see `COHERENCE_VALIDATION.md`.
 
 ## Files
 
@@ -55,7 +55,7 @@ script restores the original binary when it exits):
 experiments/sharer-counts/timing.sh 5 /tmp/t sniper.before sniper.after
 ```
 
-Coherence regression test and tracing:
+Coherence regression test and tracing (see `COHERENCE_VALIDATION.md`):
 
 ```
 experiments/sharer-counts/run_regress.sh regress -n 2 -c gainestown
@@ -88,11 +88,11 @@ Per cache component and core (`L1-D`, `L2`, `L3`, ...), recorded when LRU picks 
 
 Per L2 controller, at fill time: `sharer-hint-fills`, `-fills-write`, `-fill-{1,2,3,4plus}`,
 `-write-with-sharers` (must be 0), `-exclusive-with-sharers` (read fill granted E/M while other
-cores hold the line, see below), `-write-hit-resets` (write hit on M that lowered a hint > 1).
+cores hold the line; 0 since the MESI fill fix), `-write-hit-resets` (write hit on M that lowered
+a hint > 1; 0 since the fix, as M no longer coexists with other copies).
 
 With `SNIPER_COHERENCE_CHECK=1`, per private cache: `coherence-check-stale-write-hits`, write
-hits while another core's private copy exists below the same shared cache (must be 0 under MESI;
-see the known limitation below).
+hits while another core's private copy exists below the same shared cache (must be 0).
 
 `check_sharers.py` fails a run on any broken invariant, any presence-bitmap mismatch, a
 nonzero `write-with-sharers` or a nonzero `coherence-check-stale-write-hits`. An inexact hint is
@@ -119,34 +119,22 @@ needs the L3 presence bits, so it exists only with `ENABLE_TRACK_SHARING_PREVCAC
 for a cache whose next level is shared (`shared_cores > 1`); L1 caches get no hint yet. The
 per-core reading of the bits assumes one private L2 per core under the L3 (at most 8).
 
-## Results (2026-11-19, 4-core Gainestown)
+## Results (2026-11-19, 4-core Gainestown, with the MESI fill fix)
 
-Every run passes `check_sharers.py`: the presence bitmap matched the probe at every victim, and
-no write fill delivered a hint with other sharers listed.
+Every run passes `check_sharers.py`: the presence bitmap matched the probe at every victim, no
+write fill delivered a hint with other sharers listed, and no stale write hit occurred.
 
 | Workload | L2 victims compared | Hint exact | MAE | Heavy class differs |
 |---|---|---|---|---|
-| FFT -m 16, 8 MB L3 | 437,975 | 94.4% | 0.061 | 0.45% |
-| FFT -m 16, 512 KB L3 | 62,615 | 99.8% | 0.002 | 0.04% |
-| sharetest r, K = 1..4, 1 MB L3 | 21-36k per run | 99.5 / 92.1 / 90.2 / 81.4% | <= 0.25 | up to 13% (K = 4) |
-| sharetest w, K = 1..4, 1 MB L3 | 15-38k per run | 99.6 / 95.4 / 94.6 / 82.3% | <= 0.37 | up to 15% (K = 4) |
-| sharetest p, K = 1..4, 1 MB L3 | 16-26k per run | >= 99.3% | <= 0.011 | < 0.5% |
-| sharetest u, K = 1..4, 1 MB L3 | 17-34k per run | 99.7 / 92.4 / 88.6 / 61.6% | <= 0.66 | up to 27% (K = 4) |
-| all modes, 512 KB L3 | 2.5-3.8k per run | >= 99.3% | <= 0.016 | < 0.6% |
+| FFT -m 16, 8 MB L3 | 438,344 | 94.3% | 0.061 | 0.44% |
+| FFT -m 16, 512 KB L3 | 62,550 | 99.8% | 0.002 | 0.02% |
+| sharetest r, K = 1..4, 1 MB L3 | 15-41k per run | 99.3 / 95.0 / 82.9 / 83.0% | <= 0.23 | up to 16% |
+| sharetest w, K = 1..4, 1 MB L3 | 17-26k per run | 99.1 / 94.6 / 85.5 / 83.7% | <= 0.32 | up to 13% |
+| sharetest p, K = 1..4, 1 MB L3 | 17-29k per run | >= 99.2% | <= 0.012 | < 0.3% |
+| sharetest u, K = 1..4, 1 MB L3 | 14-21k per run | 98.6 / 96.3 / 79.1 / 70.7% | <= 0.40 | up to 18% |
+| all modes, 512 KB L3 | 2.4-3.8k per run | >= 97.4% | <= 0.036 | < 0.7% |
 
 With a 512 KB L3 most lines leave the L2 through L3 back-invalidation, so few L2 victims remain
 and they are mostly private. Read sharing makes the hint stale-low for early readers (later
-readers join unseen) and stale-high for later ones (earlier holders leave unseen).
-
-## Known limitation: L2 MESI state with a shared L3
-
-Sniper copies the L3's state into the L2 on a fill. The L3's state describes the L3 against the
-directory and is nearly always E or M, so a read fill can arrive in E/M while other cores hold
-the line in S (`sharer-hint-exclusive-with-sharers`, about 2,050 per extra reader in `r`). A
-later write by that core is then a silent hit and the other copies are not invalidated: mode `u`
-shows `write-hit-resets` = 2016 and almost no `coherency-invalidates` at the other cores. The
-hint follows the protocol (1 after the write), the oracle sees the stale copies, which is most of
-the `u` error. The L2 MESI state and the coherence events in this configuration are therefore not
-those of a MESI protocol. A possible fix is to grant S on a read fill when the L3's presence bits
-list another core; it changes the simulated protocol and has not been made. `run_regress.sh`
-reproduces the failure deterministically: on dirty lines the write leaves core 0's copies valid.
+readers join unseen) and stale-high for later ones (earlier holders leave unseen). Results
+before the fix, and the effect of the fix, are in `COHERENCE_VALIDATION.md`.

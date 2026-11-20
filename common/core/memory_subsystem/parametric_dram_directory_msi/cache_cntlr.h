@@ -591,6 +591,10 @@ namespace ParametricDramDirectoryMSI
          bool isInLowerLevelCache(CacheBlockInfo *block_info);
          void incrementQBSLookupCost();
          OracleSharerInfo queryOracleSharers(CacheBlockInfo *block_info);
+         // MESI fill fix: does a cache directly above this (shared) cache, other than
+         // `requester`'s own, hold the line? Used to grant S rather than this
+         // cache's own E/M state to a reading private cache (copyDataFromNextLevel).
+         bool otherUpperCacheHolds(IntPtr address, CacheCntlr *requester);
          // Delivered sharer hint: does this cache receive one from the next level, and
          // (called on that shared next level) how many cores other than `requester`
          // its own presence bits list for the line, as reported with a fill response.

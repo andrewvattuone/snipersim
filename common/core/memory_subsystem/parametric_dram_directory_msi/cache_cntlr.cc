@@ -1260,9 +1260,28 @@ namespace ParametricDramDirectoryMSI
 
 		CacheState::cstate_t cstate = m_next_cache_cntlr->getCacheState(address);
 		// CacheBlockInfo::block_type_t block_type = m_next_cache_cntlr->getCacheBlockType(address);
+
+		// MESI fill fix (senior-design-rl). A shared next level's E or M state is its
+		// state towards the directory, not a permission for one of the cores above
+		// it: copied into a reading private cache while another core still holds
+		// the line, it let both hold E/M + S, and a later write by this core hit
+		// silently and never invalidated the other copies. The next level has just
+		// downgraded every other holder to S (its read-hit path), so a reader that
+		// finds other holders gets S as well. Without other holders the next level's
+		// state is kept: E, or M when the next level's copy is dirty, which Sniper
+		// needs for write permission (only M is writable, and a private M line must
+		// sit on an M line below it to be written back). Writes are unaffected: the
+		// next level invalidated the other copies before granting M.
+		const CacheState::cstate_t next_cstate = cstate;
+		if (mem_op_type == Core::READ && m_next_cache_cntlr->m_shared_cores > 1
+			&& (cstate == CacheState::EXCLUSIVE || cstate == CacheState::MODIFIED)
+			&& m_next_cache_cntlr->otherUpperCacheHolds(address, this))
+			cstate = CacheState::SHARED;
+
 		if (LineTracer::matchesPhysical(address))
-			LineTracer::print("  %s c%d fill for %s: copies state %c of %s", MemComponentString(m_mem_component), m_core_id,
-				mem_op_type == Core::READ ? "READ" : "WRITE", CStateString(cstate), MemComponentString(m_next_cache_cntlr->m_mem_component));
+			LineTracer::print("  %s c%d fill for %s: %s state %c, granted %c", MemComponentString(m_mem_component), m_core_id,
+				mem_op_type == Core::READ ? "READ" : "WRITE", MemComponentString(m_next_cache_cntlr->m_mem_component),
+				CStateString(next_cstate), CStateString(cstate));
 
 		// TODO: increment time? tag access on next level, also data access if this is not an upgrade
 
@@ -2684,6 +2703,19 @@ namespace ParametricDramDirectoryMSI
 		}
 
 		return info;
+	}
+
+	bool
+	CacheCntlr::otherUpperCacheHolds(IntPtr address, CacheCntlr *requester)
+	{
+		// Functional stand-in for the snoop responses this cache has just collected
+		// while downgrading the other holders (equivalently, its presence bits).
+		// The list holds master caches only, so compare masters to skip the requester.
+		const CacheCntlrList &prev = m_master->m_prev_cache_cntlrs;
+		for (CacheCntlrList::const_iterator it = prev.begin(); it != prev.end(); ++it)
+			if ((*it)->m_master != requester->m_master && (*it)->getCacheBlockInfo(address) != NULL)
+				return true;
+		return false;
 	}
 
 	bool
