@@ -323,6 +323,7 @@ namespace ParametricDramDirectoryMSI
            UInt64 sharer_hint_write_with_sharers;         // write fill while others still listed (expected 0)
            UInt64 sharer_hint_exclusive_with_sharers;     // read fill granted E/M while others hold the line
            UInt64 sharer_hint_write_hit_resets;           // write hit on M lowered a hint > 1 to 1
+           UInt64 stale_write_hits;                       // SNIPER_COHERENCE_CHECK: write hit while another core holds a copy
            #ifdef ENABLE_TRANSITIONS
            UInt64 transitions[CacheState::NUM_CSTATE_SPECIAL_STATES][CacheState::NUM_CSTATE_SPECIAL_STATES];
            UInt64 transition_reasons[Transition::NUM_REASONS][CacheState::NUM_CSTATE_SPECIAL_STATES][CacheState::NUM_CSTATE_SPECIAL_STATES];
@@ -595,6 +596,12 @@ namespace ParametricDramDirectoryMSI
          // its own presence bits list for the line, as reported with a fill response.
          bool receivesSharerHint() const;
          UInt32 countOtherSharers(IntPtr address, core_id_t requester);
+         // Debug (LineTracer): this cache's state for a line, its hint and presence bits, as text
+         String traceLineState(IntPtr address);
+         // Debug (SNIPER_COHERENCE_CHECK=1): count a write hit in this private cache
+         // while another core's private copy exists below the same shared cache,
+         // which MESI forbids. Oracle probe; changes no state or timing.
+         void checkStaleWriteHit(IntPtr address);
 
          void enable() { m_master->m_cache->enable(); }
          void disable() { m_master->m_cache->disable(); }

@@ -6,6 +6,8 @@
 #include "shmem_perf.h"
 #include "coherency_protocol.h"
 #include "config.hpp"
+#include "line_tracer.h"
+#include "itostr.h"
 
 #if 0
    extern Lock iolock;
@@ -107,6 +109,10 @@ DramDirectoryCntlr::handleMsgFromL2Cache(core_id_t sender, ShmemMsg* shmem_msg)
    SubsecondTime msg_time = getShmemPerfModel()->getElapsedTime(ShmemPerfModel::_SIM_THREAD);
    IntPtr address = shmem_msg->getAddress();
 
+   if (ParametricDramDirectoryMSI::LineTracer::matchesPhysical(address))
+      ParametricDramDirectoryMSI::LineTracer::print("  directory@%d <- %s from LLC %d (%s)", m_core_id,
+         ParametricDramDirectoryMSI::LineTracer::msgTypeName(shmem_msg_type), sender, describeLine(address, false).c_str());
+
    MYLOG("begin for address %lx, %d in queue", address, m_dram_directory_req_queue_list->size(address));
 
    // Look up line state in the tag directory
@@ -207,6 +213,29 @@ DramDirectoryCntlr::oracleGetNumSharers(IntPtr address, UInt32 &num_sharers)
       return false;
    num_sharers = directory_entry->getNumSharers();
    return true;
+}
+
+String
+DramDirectoryCntlr::describeLine(IntPtr address, bool take_lock)
+{
+   static const char *dstate_names[] = {"UNCACHED", "SHARED", "OWNED", "MODIFIED", "EXCLUSIVE"};
+   if (take_lock)
+      m_oracle_lock.acquire();
+   DirectoryEntry* directory_entry = m_dram_directory_cache->peekDirectoryEntry(address);
+   String text = "dir: no entry";
+   if (directory_entry)
+   {
+      DirectoryState::dstate_t dstate = directory_entry->getDirectoryBlockInfo()->getDState();
+      text = String("dir: ") + (dstate < DirectoryState::NUM_DIRECTORY_STATES ? dstate_names[dstate] : "?")
+         + " owner=" + itostr(directory_entry->getOwner()) + " sharers={";
+      std::pair<bool, std::vector<core_id_t> > sharers = directory_entry->getSharersList();
+      for (size_t i = 0; i < sharers.second.size(); ++i)
+         text += (i ? "," : "") + itostr(sharers.second[i]);
+      text += "}";
+   }
+   if (take_lock)
+      m_oracle_lock.release();
+   return text;
 }
 
 void

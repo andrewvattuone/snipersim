@@ -14,8 +14,10 @@ For every cache component and core, with v = sum(lru-victim-{M,E,S,other}):
                        == heavy-both + heavy-neither + heavy-delivered-only + heavy-oracle-only
 
 Exit status 1 if an invariant fails, the presence bitmap ever disagrees with the
-probe (cachedlocs mismatch / count-mismatch), or a write fill delivered a hint
-while other sharers were still listed (sharer-hint-write-with-sharers). An
+probe (cachedlocs mismatch / count-mismatch), a write fill delivered a hint
+while other sharers were still listed (sharer-hint-write-with-sharers), or a
+private cache had a write hit while another core held a copy
+(coherence-check-stale-write-hits, recorded with SNIPER_COHERENCE_CHECK=1). An
 inexact hint is expected (it is allowed to be stale) and is only reported.
 Sections whose stats are absent (older builds) are skipped.
 """
@@ -96,6 +98,9 @@ def check(path, verbose):
         problems.append(f'presence bitmap disagrees with probe ({tot["cv_mismatch"]} bitmap, {tot["cv_count_mismatch"]} count)')
     if not comps:
         problems.append('no cache statistics found')
+    stale = sum(sum(s.get(f'{c}.coherence-check-stale-write-hits', [0])) for c in comps)
+    if stale:
+        problems.append(f'{stale} write hits while another core held a copy (coherence check)')
     if fills['write-with-sharers']:
         problems.append(f'{fills["write-with-sharers"]} write fills delivered a hint with other sharers listed')
     hc = tot['hint_compared']

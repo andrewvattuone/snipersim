@@ -12,16 +12,21 @@ The simulator side is in `common/core/memory_subsystem`:
 | L2 delivered sharer hint (`CacheBlockInfo::m_sharer_hint`) | set in `CacheCntlr::copyDataFromNextLevel()` | Yes: reported by the L3 with the fill |
 | `oracle-*` counts | `CacheCntlr::queryOracleSharers()` | No: direct reads of other caches, diagnostics only |
 
-Nothing here feeds a replacement decision; LRU is unchanged.
+Nothing here feeds a replacement decision; LRU is unchanged. The directory also holds a
+deterministic coherence regression test and notes on Sniper's tracing and checking hooks.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `sharetest.c` | 4-thread sharing microbenchmark, modes `r`, `w`, `p`, `u` (see the header comment) |
-| `Makefile` | builds `sharetest` (native, no Sniper markers; the binary is git-ignored) |
+| `coherence_regress.c` | 2-thread deterministic coherence test: read, read, write, read on clean or dirty lines |
+| `Makefile` | builds both (native, `-no-pie` so arrays can be traced; binaries are git-ignored) |
 | `run_validation.sh` | runs the suite into `results/<prefix>-*` and checks every run |
 | `check_sharers.py` | checks the invariants in one or more `sim.stats` files and summarizes hint accuracy |
+| `run_regress.sh` | runs `coherence_regress` (write vs. read control, clean and dirty, plus a traced 1-line run) |
+| `check_regress.py` | checks a write/read pair against MESI: invalidations, coherence misses, downgrades |
+| `compare_coherence.py` | before/after table of time, IPC, misses, coherence events and victim states |
 | `compare_stats.py` | diffs two runs while ignoring the diagnostic stats |
 | `timing.sh` | interleaved host-time comparison of several saved Sniper binaries |
 
@@ -48,6 +53,14 @@ script restores the original binary when it exits):
 
 ```
 experiments/sharer-counts/timing.sh 5 /tmp/t sniper.before sniper.after
+```
+
+Coherence regression test and tracing:
+
+```
+experiments/sharer-counts/run_regress.sh regress -n 2 -c gainestown
+SNIPER_COHERENCE_CHECK=1 ./run-sniper ...     # counts write hits that MESI forbids
+SNIPER_TRACE_VADDR=0x404100 ./run-sniper ...  # [LINETRACE] of one line (address from nm)
 ```
 
 `results/` is git-ignored; keep simulation output out of the repository.
@@ -77,8 +90,13 @@ Per L2 controller, at fill time: `sharer-hint-fills`, `-fills-write`, `-fill-{1,
 `-write-with-sharers` (must be 0), `-exclusive-with-sharers` (read fill granted E/M while other
 cores hold the line, see below), `-write-hit-resets` (write hit on M that lowered a hint > 1).
 
-`check_sharers.py` fails a run on any broken invariant, any presence-bitmap mismatch, or a
-nonzero `write-with-sharers`. An inexact hint is expected and only reported.
+With `SNIPER_COHERENCE_CHECK=1`, per private cache: `coherence-check-stale-write-hits`, write
+hits while another core's private copy exists below the same shared cache (must be 0 under MESI;
+see the known limitation below).
+
+`check_sharers.py` fails a run on any broken invariant, any presence-bitmap mismatch, a
+nonzero `write-with-sharers` or a nonzero `coherence-check-stale-write-hits`. An inexact hint is
+expected and only reported.
 
 ## Delivered hint semantics
 
@@ -130,4 +148,5 @@ shows `write-hit-resets` = 2016 and almost no `coherency-invalidates` at the oth
 hint follows the protocol (1 after the write), the oracle sees the stale copies, which is most of
 the `u` error. The L2 MESI state and the coherence events in this configuration are therefore not
 those of a MESI protocol. A possible fix is to grant S on a read fill when the L3's presence bits
-list another core; it changes the simulated protocol and has not been made.
+list another core; it changes the simulated protocol and has not been made. `run_regress.sh`
+reproduces the failure deterministically: on dirty lines the write leaves core 0's copies valid.

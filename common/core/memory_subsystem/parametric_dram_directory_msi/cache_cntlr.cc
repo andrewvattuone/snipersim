@@ -201,6 +201,7 @@
  */
 
 #include "cache_cntlr.h"
+#include "line_tracer.h"
 #include "debug_config.h"
 #include "log.h"
 #include "memory_manager.h"
@@ -571,6 +572,7 @@ namespace ParametricDramDirectoryMSI
 		registerStatsMetric(name, core_id, "sharer-hint-write-with-sharers", &stats.sharer_hint_write_with_sharers);
 		registerStatsMetric(name, core_id, "sharer-hint-exclusive-with-sharers", &stats.sharer_hint_exclusive_with_sharers);
 		registerStatsMetric(name, core_id, "sharer-hint-write-hit-resets", &stats.sharer_hint_write_hit_resets);
+		registerStatsMetric(name, core_id, "coherence-check-stale-write-hits", &stats.stale_write_hits);
 #ifdef ENABLE_TRANSITIONS
 		for (CacheState::cstate_t old_state = CacheState::CSTATE_FIRST; old_state < CacheState::NUM_CSTATE_STATES; old_state = CacheState::cstate_t(int(old_state) + 1))
 			for (CacheState::cstate_t new_state = CacheState::CSTATE_FIRST; new_state < CacheState::NUM_CSTATE_STATES; new_state = CacheState::cstate_t(int(new_state) + 1))
@@ -801,6 +803,8 @@ namespace ParametricDramDirectoryMSI
 		{
 
 			cache_hit = operationPermissibleinCache(ca_address, mem_op_type, &cache_block_info);
+			if (cache_hit && mem_op_type != Core::READ)
+				checkStaleWriteHit(ca_address);
 		}
 
 		if (!cache_hit && m_perfect)
@@ -1256,6 +1260,9 @@ namespace ParametricDramDirectoryMSI
 
 		CacheState::cstate_t cstate = m_next_cache_cntlr->getCacheState(address);
 		// CacheBlockInfo::block_type_t block_type = m_next_cache_cntlr->getCacheBlockType(address);
+		if (LineTracer::matchesPhysical(address))
+			LineTracer::print("  %s c%d fill for %s: copies state %c of %s", MemComponentString(m_mem_component), m_core_id,
+				mem_op_type == Core::READ ? "READ" : "WRITE", CStateString(cstate), MemComponentString(m_next_cache_cntlr->m_mem_component));
 
 		// TODO: increment time? tag access on next level, also data access if this is not an upgrade
 
@@ -1597,6 +1604,7 @@ namespace ParametricDramDirectoryMSI
 #ifdef ENABLE_TRACK_SHARING_PREVCACHES
 				assert(!cache_block_info->hasCachedLoc());
 #endif
+				checkStaleWriteHit(address);
 				// Delivered sharer hint: writing a line held in M makes this core its
 				// sole holder as far as the protocol is concerned (ChampSim's
 				// coherence_set_modified); refreshes a stale count.
@@ -2140,6 +2148,8 @@ namespace ParametricDramDirectoryMSI
 		assert(old_cstate != CacheState::INVALID);
 
 		m_master->m_cache->invalidateSingleLine(address);
+		if (LineTracer::matchesPhysical(address))
+			LineTracer::print("  %s c%d INVALIDATE (was %c)", MemComponentString(m_mem_component), m_core_id, CStateString(old_cstate));
 
 		if (m_next_cache_cntlr)
 			m_next_cache_cntlr->notifyPrevLevelEvict(m_core_id_master, m_mem_component, address);
@@ -2185,6 +2195,10 @@ namespace ParametricDramDirectoryMSI
 											getShmemPerfModel()->getElapsedTime(thread_num), this, block_type);
 
 		SharedCacheBlockInfo *cache_block_info = setCacheState(address, cstate);
+		if (LineTracer::matchesPhysical(address))
+			LineTracer::print("  %s c%d INSERT as %c", MemComponentString(m_mem_component), m_core_id, CStateString(cstate));
+		if (eviction && LineTracer::matchesPhysical(evict_address))
+			LineTracer::print("  %s c%d EVICT (was %c)", MemComponentString(m_mem_component), m_core_id, CStateString(evict_block_info.getCState()));
 
 		if (Sim()->getInstrumentationMode() == InstMode::CACHE_ONLY)
 			cache_block_info->setOption(CacheBlockInfo::WARMUP);
@@ -2377,6 +2391,9 @@ namespace ParametricDramDirectoryMSI
 
 		SharedCacheBlockInfo *cache_block_info = getCacheBlockInfo(address);
 		__attribute__((unused)) CacheState::cstate_t old_cstate = cache_block_info ? cache_block_info->getCState() : CacheState::INVALID;
+		if (cache_block_info && LineTracer::matchesPhysical(address))
+			LineTracer::print("  %s c%d UPDATE %c -> %c (%s)", MemComponentString(m_mem_component), m_core_id,
+				CStateString(old_cstate), CStateString(new_cstate), LineTracer::reasonName(reason));
 
 		bool buf_written = false, is_writeback = false;
 
@@ -2679,6 +2696,55 @@ namespace ParametricDramDirectoryMSI
 #endif
 	}
 
+	void
+	CacheCntlr::checkStaleWriteHit(IntPtr address)
+	{
+		static const bool enabled = getenv("SNIPER_COHERENCE_CHECK") != NULL;
+		if (!enabled || m_shared_cores > 1)
+			return;
+		CacheCntlr *shared = m_next_cache_cntlr;
+		while (shared && shared->m_shared_cores <= 1)
+			shared = shared->m_next_cache_cntlr;
+		if (!shared)
+			return; // no shared level: coherence goes through the directory
+		const CacheCntlrList &peers = shared->m_master->m_prev_cache_cntlrs;
+		for (CacheCntlrList::const_iterator it = peers.begin(); it != peers.end(); ++it)
+			if ((*it)->m_core_id != m_core_id && (*it)->getCacheBlockInfo(address) != NULL)
+			{
+				ScopedLock sl(getLock());
+				if (stats.stale_write_hits++ < 10)
+					fprintf(stderr, "[COHERENCE CHECK] %s core %d write hit on %lx (%c) while core %d holds a copy in %s (%c)\n",
+						MemComponentString(m_mem_component), m_core_id, address, CStateString(getCacheState(address)),
+						(*it)->m_core_id, MemComponentString((*it)->m_mem_component), CStateString((*it)->getCacheState(address)));
+				return;
+			}
+	}
+
+	String
+	CacheCntlr::traceLineState(IntPtr address)
+	{
+		SharedCacheBlockInfo *info = getCacheBlockInfo(address);
+		String text(1, CStateString(getCacheState(address)));
+		if (info && info->getSharerHint())
+			text += "(h" + itostr((UInt32)info->getSharerHint()) + ")";
+#ifdef ENABLE_TRACK_SHARING_PREVCACHES
+		if (info && !m_master->m_prev_cache_cntlrs.empty())
+		{
+			text += " locs={";
+			bool first = true;
+			for (UInt32 idx = 0; idx < m_master->m_prev_cache_cntlrs.size(); ++idx)
+				if (info->getCachedLocs().test(idx))
+				{
+					CacheCntlr *prev = m_master->m_prev_cache_cntlrs[idx];
+					text += String(first ? "" : ",") + "c" + itostr(prev->m_core_id) + ":" + MemComponentString(prev->m_mem_component);
+					first = false;
+				}
+			text += "}";
+		}
+#endif
+		return text;
+	}
+
 	UInt32
 	CacheCntlr::countOtherSharers(IntPtr address, core_id_t requester)
 	{
@@ -2729,6 +2795,9 @@ namespace ParametricDramDirectoryMSI
 
 		acquireStackLock(address);
 		MYLOG("begin");
+		if (LineTracer::matchesPhysical(address))
+			LineTracer::print("  %s c%d <- %s from directory@%d", MemComponentString(m_mem_component), m_core_id,
+				LineTracer::msgTypeName(shmem_msg_type), sender);
 
 		switch (shmem_msg_type)
 		{

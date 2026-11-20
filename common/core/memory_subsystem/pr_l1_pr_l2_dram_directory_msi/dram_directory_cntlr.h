@@ -92,6 +92,9 @@ namespace PrL1PrL2DramDirectoryMSI
          // ORACLE diagnostic read of the sharer count, safe to call from any thread.
          // Returns false if the directory holds no entry for this (line-aligned) address.
          bool oracleGetNumSharers(IntPtr address, UInt32 &num_sharers);
+         // Debug (LineTracer): the directory's view of one line, as text. Pass
+         // take_lock = false from inside this directory's own message handlers.
+         String describeLine(IntPtr address, bool take_lock = true);
 
       private:
          // Serializes the handlers (which run on this core's sim thread) against

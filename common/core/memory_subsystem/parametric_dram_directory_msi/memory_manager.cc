@@ -18,6 +18,7 @@
 #include "mmu.h"
 #include "metadata_info.h"
 #include "trace_thread.h"
+#include "line_tracer.h"
 #include "trace_manager.h"
 #include "mimicos.h"
 #include "performance_model.h"
@@ -527,6 +528,41 @@ namespace ParametricDramDirectoryMSI
 	 *
 	 * @return The location where the memory access hit (e.g., L1 cache, L2 cache, DRAM).
 	 */
+	void
+	MemoryManager::traceLineSnapshot(IntPtr address)
+	{
+		// Debug only: reads every cache's tag state directly (no locks, no timing)
+		String text = "  state:";
+		const UInt32 num_cores = Sim()->getConfig()->getApplicationCores();
+		for (UInt32 core = 0; core < num_cores; ++core)
+		{
+			text += " | c" + itostr(core);
+			const MemComponent::component_t levels[] = {MemComponent::L1_DCACHE, MemComponent::L2_CACHE};
+			for (MemComponent::component_t level : levels)
+			{
+				CacheCntlr *cntlr = getCacheCntlrAt(core, level);
+				if (cntlr && cntlr->m_shared_cores <= 1) // shared levels are printed once below
+					text += String(" ") + MemComponentString(level) + "=" + cntlr->traceLineState(address);
+			}
+		}
+		for (UInt32 core = 0; core < num_cores; ++core)
+		{
+			const MemComponent::component_t levels[] = {MemComponent::L1_DCACHE, MemComponent::L2_CACHE, MemComponent::L3_CACHE};
+			for (MemComponent::component_t level : levels)
+			{
+				CacheCntlr *cntlr = getCacheCntlrAt(core, level);
+				if (cntlr && cntlr->m_shared_cores > 1 && cntlr->m_core_id == cntlr->m_core_id_master)
+					text += String(" | ") + MemComponentString(level) + "[c" + itostr(core) + "-" + itostr(core + cntlr->m_shared_cores - 1)
+						+ "]=" + cntlr->traceLineState(address);
+			}
+		}
+		core_id_t home = getTagDirectoryHomeLookup()->getHome(address);
+		MemoryManager *home_mm = static_cast<MemoryManager *>(Sim()->getCoreManager()->getCoreFromID(home)->getMemoryManager());
+		if (home_mm->getDramDirectoryCntlr())
+			text += " | " + home_mm->getDramDirectoryCntlr()->describeLine(address);
+		LineTracer::print("%s", text.c_str());
+	}
+
 	HitWhere::where_t
 	MemoryManager::coreInitiateMemoryAccess(
 		IntPtr eip,
@@ -695,6 +731,15 @@ namespace ParametricDramDirectoryMSI
 
 		// Clear the MetadataContext after the data access
 		MetadataContext::clear(getCore()->getId());
+
+		if (LineTracer::matchesVirtual(address) && !is_instruction)
+		{
+			LineTracer::notePhysical(physical_address);
+			LineTracer::print("core %d %s v=%#lx p=%#lx -> %s", getCore()->getId(),
+				mem_op_type == Core::READ ? "READ" : mem_op_type == Core::WRITE ? "WRITE" : "READ_EX",
+				(unsigned long)address, (unsigned long)physical_address, HitWhereString(result));
+			traceLineSnapshot(physical_address);
+		}
 
 #if DEBUG_MEM_MANAGER >= DEBUG_BASIC
 			log_file_mmu << "Memory Access: " << address  << " Finished Memory Access at time " << getShmemPerfModel()->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS() << std::endl;
