@@ -5,12 +5,13 @@
  * A tiny functional cache model used by the scenario tests. It drives the cores in the order the Stage 2 Sniper adapter
  * will, following CacheSet::insert / CacheSetLRU::getReplacementIndex:
  *
- *   fill(tag):  if an invalid way exists: take the lowest one, move it to MRU          (no decision, no eviction)
+ *   fill(tag):  demand fill: policy.on_miss(set, tag) first, before anything else     (ChampSim: tag check)
+ *               if an invalid way exists: take the lowest one, move it to MRU          (no decision, no eviction)
  *               else: candidates = LRU order of the valid ways, oldest first
  *                     d = policy.choose(...); policy.commit(...)
  *                     policy.on_eviction(set, victim tag, d.victim_features)
  *                     move the victim way to MRU                                       (CacheSetLRU does this too)
- *               install the block, then policy.on_fill(..., FillKind::demand)
+ *               install the block, then policy.on_fill(...)
  *   hit(way):   move to MRU, policy.on_hit                                              (only recency-updating hits)
  *   invalidate: the block becomes invalid, policy.on_invalidate(reason)
  *   upgrade:    invalidate(upgrade), then refill the same tag as M (lowest invalid way, moved to MRU) with
@@ -83,6 +84,8 @@ public:
                   rlrepl::FillKind kind = rlrepl::FillKind::demand)
   {
     FillResult r;
+    if (kind == rlrepl::FillKind::demand)
+      policy.on_miss(set, tag);
     auto& ways = blocks.at(set);
     std::optional<std::uint32_t> invalid;
     for (std::uint32_t w = 0; w < ways.size() && !invalid; ++w)
@@ -113,7 +116,7 @@ public:
     if constexpr (std::is_same_v<Policy, rlrepl::RewardPolicy>)
       policy.on_fill(set, r.way, tag, kind);
     else
-      policy.on_fill(set, tag, kind);
+      policy.on_fill(set, tag);
     return r;
   }
 

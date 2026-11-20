@@ -1,5 +1,5 @@
 // Souza-Freitas reproduction core (rl_paper_policy.h). Ports ChampSim test/cpp/src/446-souza-freitas.cc where the
-// logic is shared, plus tests for the Sniper-port interface (candidate list, AND/OR, rewards at demand fills).
+// logic is shared, plus tests for the Sniper-port interface (candidate list, AND/OR, rewards at misses).
 
 #include <initializer_list>
 
@@ -253,7 +253,8 @@ TEST_CASE("paper: mode off returns the base policy's choice and records nothing"
   REQUIRE(d.victim == 0);
   REQUIRE_FALSE(d.checked);
   p.commit(d);
-  p.on_fill(0, 1, FillKind::demand);
+  p.on_miss(0, 1);
+  p.on_fill(0, 1);
   REQUIRE(p.stats.decisions == 0);
   REQUIRE(p.stats.positive_rewards == 0);
 }
@@ -283,23 +284,26 @@ TEST_CASE("paper: history per set, capacity 2 x associativity, isolated between 
   REQUIRE(d.empty_history);
 }
 
-TEST_CASE("paper: rewards are counted at demand fills; only the removal affects the weights")
+TEST_CASE("paper: rewards are counted at misses; only the removal affects the weights")
 {
   auto p = policy_with(cfg(Mode::state), {{7, M_bt}, {8, E_bt}});
   REQUIRE_APPROX(compute_ratio_weights(p.history(0)).m, 0.5);
 
-  p.on_fill(0, 7, FillKind::demand); // returning evicted block: -1, entry removed
+  p.on_miss(0, 7); // returning evicted block: -1, entry removed
   REQUIRE(p.stats.negative_rewards == 1);
   REQUIRE_FALSE(p.history(0).contains(7));
   REQUIRE_APPROX(compute_ratio_weights(p.history(0)).e, 1.0);
 
-  p.on_fill(0, 7, FillKind::demand); // not in the history any more: +1, nothing changes
+  p.on_fill(0, 7);
+  p.on_miss(0, 7); // not in the history any more: +1, nothing changes
   REQUIRE(p.stats.positive_rewards == 1);
   REQUIRE(p.history(0).size() == 1);
 
-  p.on_fill(0, 8, FillKind::upgrade_refill); // not a miss: no reward counted
+  p.on_fill(0, 8); // a fill without on_miss (not a miss): no reward; an entry found here is removed and counted
   REQUIRE(p.stats.negative_rewards == 1);
   REQUIRE(p.stats.positive_rewards == 1);
+  REQUIRE(p.stats.refill_removals == 1);
+  REQUIRE(p.history(0).empty());
 }
 
 TEST_CASE("paper: weight averages are accumulated only for decisions with a history")

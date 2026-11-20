@@ -34,6 +34,7 @@ Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build)
 | `test_paper_policy.cc` | Paper core (ports ChampSim test 446) |
 | `test_reward_policy.cc` | Reward core (ports ChampSim test 447) |
 | `test_scenarios.cc` | End-to-end deterministic scenarios |
+| `test_event_order.cc` | Regression tests for the order of events on a miss (history lookup before the eviction) |
 | `Makefile`, `.gitignore` | Build/run; the test binary is ignored |
 
 ## Running the tests
@@ -44,7 +45,7 @@ testing/unit/rl/rl_unit_tests paper    # only test cases whose name contains "pa
 make -C testing/unit/rl clean
 ```
 
-Expected: `53 test cases, 0 failed, 593 assertions`.
+Expected: `63 test cases, 0 failed, 643 assertions`.
 
 ## Architecture
 
@@ -65,6 +66,31 @@ Expected: `53 test cases, 0 failed, 593 assertions`.
 * **Every core call is deterministic.** There is no random number generator (exploration is not ported).
 * **choose / commit split.** `choose()` is `const` and changes nothing; `commit()` applies the decision. In Sniper both
   happen inside `getReplacementIndex`, but the split keeps decisions testable and matches ChampSim.
+
+### Event lifecycle of a miss
+
+```
+on_miss(set, tag)                                   history lookup for the incoming block: remove + (-1)
+[ choose -> commit -> on_eviction(victim) ]         only if no invalid way; victim enters the history (+1 on age-out)
+on_fill(...)                                        metadata of the installed block
+```
+
+The incoming block's history lookup must come **before** the victim is chosen and recorded. This is ChampSim's order:
+`CACHE::try_hit` calls `update_replacement_state` on every tag check, misses included (`src/cache.cc:398`), and the
+victim is chosen later in `handle_fill` (`find_victim` at `:241`, `replacement_cache_fill` at `:291`).
+`rl_mesi::on_access` applies the −1 there; `souza_freitas::update_replacement_state` removes the entry there and again
+at the fill, before inserting the victim.
+
+Recording the victim first is wrong when the history is full:
+
+* With history `[A, B, C, D]` and a miss on B that evicts X, the victim's insertion ages out A (a spurious +1) before
+  B's entry is removed. The result is `[C, D, X]` instead of `[A, C, D, X]`.
+* If the returning block is itself the oldest entry, it is aged out with a +1 and its −1 is lost.
+* Both cores would also decide with the returning entry still present: stale ratio weights in the paper core, and the
+  −1 not yet applied in the modified core.
+
+The Stage 1 version had this defect; `test_event_order.cc` reproduces it (6 of its 7 ordering tests fail against
+that version) and guards the fix.
 
 ## Paper reproduction core (`PaperPolicy`)
 
@@ -94,12 +120,15 @@ evicts only E, the sharing check only below-threshold blocks.
 * A rejected candidate gets its second chance and candidate #2 is evicted **without any check**.
 * With fewer than two candidates, or mode off, candidate #1 is evicted.
 
-**Rewards.** The paper's −1/+1 change nothing directly, and no update rule is invented. On a demand fill:
+**Rewards.** The paper's −1/+1 change nothing directly, and no update rule is invented. On a miss (`on_miss`, before
+the victim for that fill is chosen):
 
-* if the tag is in the history: the entry is removed (which is what changes later ratios) and −1 is counted;
+* if the tag is in the history: the entry is removed (which is what changes later ratios, including the ones used for
+  this miss's own decision) and −1 is counted;
 * otherwise +1 is counted.
 
-Rewards are statistics only (`PaperStats`).
+Rewards are statistics only (`PaperStats`). `on_fill` normally finds nothing; an entry found there (a fill not preceded
+by `on_miss`) is removed silently and counted in `refill_removals`, which should stay 0 in Sniper.
 
 ## Modified reward-learning core (`RewardPolicy`)
 
@@ -133,7 +162,7 @@ taken, never the block's current features:
 
 | Event | Core call | Reward | Features updated |
 |---|---|---|---|
-| Evicted block refilled while its entry is still in the history | `on_fill(demand)` | −1 | saved in the history entry (at eviction) |
+| Evicted block misses again while its entry is still in the history | `on_miss` (before the victim is chosen) | −1 | saved in the history entry (at eviction) |
 | History entry pushed out by a later eviction | `on_eviction` | +1 | the aged-out entry's |
 | Protected (passed-over) block hit | `on_hit` | −1 | protection snapshot |
 | Protected block evicted without a hit | `commit` | +1 | protection snapshot |
@@ -166,8 +195,11 @@ Paper core vs. `souza_freitas`:
 1. Base policy abstracted as a candidate list. `sf::select_victim` took `first()`/`second()` callbacks. SRRIP is not
    ported (its next attempt also rewrites an RRPV, which a plain list cannot express; it will need a base-policy hook).
 2. `Combine::Or` added; ChampSim only had And.
-3. Rewards are counted at demand fills (misses, [P24] §II-A), not on every access including hits. Only the statistics
-   differ; ChampSim's +1 count included hits.
+3. Rewards are counted at misses (`on_miss`, [P24] §II-A), not on every access including hits. Only the statistics
+   differ; ChampSim's +1 count included hits. As in ChampSim, the returning block's entry is removed before the victim
+   is chosen and inserted. For a fill with no preceding miss (ChampSim write-backs, which do not occur in Sniper's
+   inclusive hierarchy), ChampSim removes the incoming entry before inserting the victim; here `on_eviction` comes first
+   and `on_fill` removes it afterwards, counted in `refill_removals`.
 4. Default `mode` is `both` (approved setting); ChampSim's `SF_MODE` default was `state`.
 5. Sharer class comes from a count supplied by the caller (Sniper: the delivered hint) instead of reading the directory's
    current mask (oracle) inside the policy.
@@ -181,8 +213,11 @@ Reward core vs. `rl_mesi`:
 3. Recency comes from the base policy (`LruOrder`, Sniper's rank permutation) instead of `rl_mesi`'s per-line
    `last_used` stamps. The orders differ only before every way has been filled once (ChampSim: all-zero stamps, ties
    to the lowest way; Sniper: way K−1 starts as LRU), and Sniper fills invalid ways before asking for a victim.
-4. The −1 for a returning block is taken at the fill (`on_fill(demand)`) instead of at the miss's tag check. In Sniper
-   every miss ends in an insert, so the event is the same; the victim for that fill is chosen first (as in ChampSim).
+4. The −1 for a returning block is applied in `on_miss`, before the victim for its fill is chosen, as `rl_mesi`'s
+   `on_access` (miss) precedes `find_victim`. In ChampSim other events may happen between the tag check and the fill;
+   in Sniper the adapter reports `on_miss` at the start of the insert (see Stage 2), when no other replacement event of
+   this set can intervene. A fill not preceded by `on_miss` removes a stale entry silently (`refill_removals`), as
+   `rl_mesi::on_fill` does for write-back fills.
 5. `scope = per_set` added (default global, as ChampSim).
 6. The pass counter and `max_passes` diagnostics added; no behavior change.
 7. Mode `off`, N = 1 and frozen zero weights reproduce the base policy's victims exactly (test "N=1 and zero weights
@@ -219,18 +254,20 @@ Ways, oldest first:
    * A and B are protected, with snapshots `{M, BT}` and `{S, BT/AT}`; D is younger than C, so it is not protected.
    * C enters the history and X ages out (+1): wS = −0.17, wBT = 0.19.
 2. **Hit on B** (protected, −1 to `{S, AT}`): wS = −0.253, wAT = −0.46.
-3. **Miss on C.** The victim is chosen first, with scores A 0.09, D −0.063, P 0.09, Q 0.09.
-   * The tie goes to the oldest, A. It was protected and never hit: +1 to `{M, BT}` gives wM = 0.01, wBT = 0.271.
-   * A enters the history and W ages out (+1 `{E, BT}`): wE = 0.28, wBT = 0.3439.
-   * Then C's fill finds C in the history (−1 `{E, BT}`): wE = 0.152, wBT = 0.20951.
-4. **Miss on Z.** LRU would evict D (S, score −0.04349), but P, Q and R (M) now score 0.21951. P is evicted and D is
+3. **Miss on C.** The miss is seen first.
+   * C is in the history (−1 `{E, BT}`): wE = 0.08, wBT = 0.071. This also frees C's history slot.
+   * Victim scores with the updated weights: A −0.029, D −0.182, P −0.029, Q −0.029. The tie goes to the oldest, A.
+   * A was protected and never hit: +1 to `{M, BT}` gives wM = 0.01, wBT = 0.1639.
+   * A takes C's free slot in the history, so nothing ages out.
+4. **Miss on Z.** LRU would evict D (S, score −0.0891), but P, Q and R (M) now score 0.1739. P is evicted and D is
    protected.
-   * The history had a free slot (C's entry was removed in step 3), so nothing ages out and the weights do not change.
-5. **Miss on block 11.** D is passed over again (`passes` = 2) and Q is evicted. Entry 902 `{M, BT}` ages out (+1):
-   wM = 0.109, wBT = 0.288559.
+   * P enters the full history and W ages out (+1 `{E, BT}`): wE = 0.172, wBT = 0.24751.
+5. **Miss on block 11.** D (−0.00549) is passed over again (`passes` = 2) and Q (0.25751) is evicted. Entry 902
+   `{M, BT}` ages out (+1): wM = 0.109, wBT = 0.322759.
 
-[`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) §3.2 shows the same weights as an illustration with independent events; this
-scenario is the exact sequence the cores produce when the events happen in Sniper's order.
+After step 3 the weights equal the end of the illustration in [`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) §3.2
+(wE 0.08, wM 0.01, wBT 0.164, wS −0.253, wAT −0.46). This scenario is the exact sequence the cores produce when the
+events happen in Sniper's order.
 
 ## Stage 2 integration interface
 
@@ -239,6 +276,7 @@ set and one policy object per cache, and maps Sniper's events as follows.
 
 | Sniper | Core |
 |---|---|
+| Start of `CacheSet::insert` for a demand fill, before `getReplacementIndex` | `on_miss(set, incoming tag)`: the tag is `cache_block_info->getTag()` (set by `Cache::insertSingleLine`); not for an upgrade refill |
 | `CacheSet::insert` → `getReplacementIndex(cntlr)` with an invalid way | lowest invalid way, `LruOrder::touch`; no decision |
 | `getReplacementIndex` with all ways valid | `candidates = LruOrder::candidates(K, isValidReplacement)`; `d = choose(set, candidates, info)`; `commit`; `on_eviction(set, victim tag, d.victim_features)`; `touch(victim)` |
 | After the clone of the new block in `insert` | `on_fill(set, way, tag, demand)` (or `upgrade_refill`) |
@@ -252,7 +290,12 @@ used in an explicitly labeled comparison mode.
 
 Hooks Sniper needs, each a no-op for every existing policy so the LRU baseline is unchanged:
 
-1. `CacheSet::insert` must call a virtual notification after the clone (the policy needs the new tag and the fill kind).
+1. `CacheSet::insert` must notify the policy twice: at its start, before `getReplacementIndex` (`on_miss` with the
+   incoming tag, for a demand fill), and after the clone (`on_fill`). `Cache::insertSingleLine` has already set the tag
+   on the incoming `cache_block_info`. Reporting the miss at the start of the insert rather than at the controller's
+   tag check is equivalent here. Between a private L2's tag-check miss and its insert, the only events in that set are
+   invalidations from the simulator thread (coherence, back invalidation), which never touch the history, because the
+   core's user thread is blocked on the miss.
 2. `CacheSet::invalidate` (via `Cache::invalidateSingleLine`) needs the reason. `CacheCntlr::updateCacheBlock` knows
    it (`Transition::COHERENCY`, `BACK_INVAL`, `UPGRADE`); the self-invalidations before forwarding a write
    (`processMemOpFromCore`, `processShmemReqFromPrevCache`) must pass `upgrade`.
@@ -284,6 +327,41 @@ Things the adapter must get right (audit I-3, I-21):
 * **Paper ambiguities** kept as options: rule, combine, retain (only `stay` implemented, as approved). The
   boundary/polarity of the threshold follows [P24] (`> cores/2`).
 * **Delivered hint 0** (no hint) classifies as below the threshold, as ChampSim's 0. L1 caches get no hint yet (I-18).
-* **Upgrade carry-over** keeps one pending upgrade per set, matched by tag. Sniper re-inserts immediately after the
-  invalidation; an unmatched refill is counted (`upgrade_refills_unmatched`) and starts fresh.
+* **Upgrade carry-over** keeps one pending upgrade per set, matched by tag (see "Overlapping upgrades" below).
 * **No hardware cost** (latency, storage, energy) is modeled; full tags and `double` weights, as in ChampSim.
+
+### Overlapping upgrades
+
+**Can an upgrade overlap another in the same set?** Sniper's upgrade of a private copy is: invalidate the own copy,
+forward the write to the next level, refill. At the L2 the steps are:
+
+* invalidate the upper levels and the L2's own copy (`cache_cntlr.cc:1700-1716`);
+* call `m_next_cache_cntlr->processShmemReqFromPrevCache`;
+* on an L3 hit, `copyDataFromNextLevel` refills synchronously;
+* on an L3 miss, the requester releases the stack lock, blocks in `waitForNetworkThread`, and refills when it wakes
+  (`cache_cntlr.cc:752-765`).
+
+Only the cache's own user threads start upgrades. While the lock is released, the simulator thread can only invalidate
+lines (directory `INV`/`FLUSH`, L3 back invalidations), which never creates a pending upgrade.
+
+* **No overlap** when one hardware thread uses the cache: a private L1/L2 with `logical_cpus = 1`, which includes the
+  Stage 2 target (Gainestown private L2). That thread is blocked until its refill completes, so at most one upgrade is
+  pending per cache.
+* **Overlap is possible** when several user threads share the cache:
+  * SMT: `memory_manager.cc:170` multiplies `shared_cores` by `logical_cpus`, so a "private" L2 is shared by the SMT
+    threads;
+  * or a cache with `shared_cores > 1` that is not the last level.
+
+  Two threads can then each be waiting between their invalidation and refill, with blocks in the same set. The last
+  level does not invalidate and refill: it upgrades in place through `SHARED_UPGRADING`, and those ways are excluded
+  from replacement.
+
+**Consequence.** With one slot per set, the second upgrade invalidation replaces the first (`upgrade_stash_overwritten`).
+The first block's refill does not match, so it starts with fresh metadata (`upgrade_refills_unmatched`): its protection
+and pass count are lost. Nothing is misattributed (the match is by tag), no reward is given, and the second block is
+restored normally. A refill that does not match leaves another block's pending upgrade in place. This was corrected
+alongside the ordering fix; previously it cleared the slot.
+
+**Recommendation.** Keep the single slot for the Stage 2 target, and check `upgrade_stash_overwritten == 0` in the
+integration tests. Before using the policy in SMT or shared non-last-level configurations, replace the slot with a small
+per-set list of pending upgrades keyed by tag, at most one per hardware thread sharing the cache.

@@ -154,6 +154,7 @@ TEST_CASE("reward: mode off is the base policy's choice and learns nothing")
   REQUIRE_FALSE(d.learned);
   p.commit(0, d);
   p.on_eviction(0, 10, S_bt);
+  p.on_miss(0, 10);
   p.on_fill(0, 0, 10, FillKind::demand);
   p.on_hit(0, 0);
   REQUIRE(p.stats.decisions == 0);
@@ -289,12 +290,13 @@ TEST_CASE("reward: protection feedback disabled marks nothing and gives no prote
   REQUIRE_APPROX(p.weights().state_weight(Mesi::S), 0.0);
 }
 
-TEST_CASE("reward: history feedback, -1 when the block returns, +1 when its entry ages out")
+TEST_CASE("reward: history feedback, -1 when the block misses again, +1 when its entry ages out")
 {
   // Ported from ChampSim 447. 2 ways: history capacity 4
   RewardPolicy p{cfg(Mode::state, 4, 0.5), 1, 2};
   p.on_eviction(0, 10, E_bt);
-  p.on_fill(0, 0, 10, FillKind::demand); // block 10 returns
+  p.on_miss(0, 10); // block 10 returns
+  p.on_fill(0, 0, 10, FillKind::demand);
   REQUIRE(p.stats.evict_bad == 1);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::E), -0.5);
   REQUIRE_FALSE(p.history(0).contains(10));
@@ -325,7 +327,7 @@ TEST_CASE("reward: feedback goes to the saved snapshot, not to the block's curre
 
   // History entries keep the features recorded at eviction
   p.on_eviction(0, 77, d.victim_features); // E, below
-  p.on_fill(0, 1, 77, FillKind::demand);
+  p.on_miss(0, 77);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.5 + 0.5 * (-1.0 - 0.5));
   REQUIRE_APPROX(p.weights().share_weight(false), -0.5);
 }
@@ -334,12 +336,12 @@ TEST_CASE("reward: weights are global, shared by every set; histories are per se
 {
   RewardPolicy p{cfg(Mode::state, 4, 0.5), 3, 2};
   p.on_eviction(0, 10, E_bt);
-  p.on_fill(1, 0, 10, FillKind::demand); // same tag in another set: not that set's history
+  p.on_miss(1, 10); // same tag in another set: not that set's history
   REQUIRE(p.stats.evict_bad == 0);
   REQUIRE(p.history(0).contains(10));
   REQUIRE(p.history(1).empty());
 
-  p.on_fill(0, 0, 10, FillKind::demand);
+  p.on_miss(0, 10);
   REQUIRE(p.stats.evict_bad == 1);
   REQUIRE_APPROX(p.weights(0).state_weight(Mesi::E), -0.5);
   REQUIRE_APPROX(p.weights(2).state_weight(Mesi::E), -0.5); // the same table
@@ -353,7 +355,7 @@ TEST_CASE("reward: per-set weight scope keeps each set's weights separate")
   c.scope = WeightScope::per_set;
   RewardPolicy p{c, 2, 2};
   p.on_eviction(0, 10, E_bt);
-  p.on_fill(0, 0, 10, FillKind::demand);
+  p.on_miss(0, 10);
   REQUIRE_APPROX(p.weights(0).state_weight(Mesi::E), -0.5);
   REQUIRE_APPROX(p.weights(1).state_weight(Mesi::E), 0.0);
   REQUIRE(parse_weight_scope("per_set") == WeightScope::per_set);
@@ -373,6 +375,7 @@ TEST_CASE("reward: coherence and back invalidations are not evictions and give n
   REQUIRE(p.stats.invalidations[0] == 1);
 
   // The invalidated block misses again: it was never in the history, so the policy is not blamed
+  p.on_miss(0, 100);
   p.on_fill(0, 0, 100, FillKind::demand);
   REQUIRE(p.stats.evict_bad == 0);
 
@@ -405,6 +408,27 @@ TEST_CASE("reward: an upgrade (invalidate + refill) keeps the block's metadata a
   p.on_fill(0, 1, 555, FillKind::upgrade_refill);
   REQUIRE(p.stats.upgrade_refills_unmatched == 1);
   REQUIRE_FALSE(p.line(0, 1).is_protected);
+}
+
+TEST_CASE("reward: overlapping upgrades in one set keep only the latest pending metadata (documented limit)")
+{
+  // Cannot happen in a cache used by a single hardware thread (Sniper's private L2 without SMT): the core is blocked
+  // until its upgrade refill completes. With SMT or a shared non-last-level cache it can; the first refill then starts
+  // with fresh metadata (no misattribution, matched by tag) and the overlap is counted. See POLICY_CORES.md.
+  RewardPolicy p{cfg(Mode::both, 4, 0.5), 1, 4, weights_after(Mode::both, M_bt, +1.0, 0.5)};
+  auto d = p.choose(0, oldest_first(4), table({S_bt, S_bt, M_bt, S_bt}));
+  p.commit(0, d); // ways 0 and 1 protected
+
+  p.on_invalidate(0, 0, 100, InvalidationReason::upgrade);
+  p.on_invalidate(0, 1, 101, InvalidationReason::upgrade); // second upgrade before the first refill
+  REQUIRE(p.stats.upgrade_stash_overwritten == 1);
+  p.on_fill(0, 0, 100, FillKind::upgrade_refill);
+  REQUIRE_FALSE(p.line(0, 0).is_protected); // lost
+  REQUIRE(p.stats.upgrade_refills_unmatched == 1);
+  p.on_fill(0, 1, 101, FillKind::upgrade_refill);
+  REQUIRE(p.line(0, 1).is_protected);
+  REQUIRE(p.stats.upgrade_carryovers == 1);
+  REQUIRE(p.stats.protect_good + p.stats.protect_wasted + p.stats.evict_bad + p.stats.evict_good == 0);
 }
 
 TEST_CASE("reward: a demand fill resets the way's metadata")
@@ -460,7 +484,7 @@ TEST_CASE("reward: protected blocks receive a protection reward and later a hist
   p.on_fill(0, 0, 21, FillKind::demand);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.5);
 
-  p.on_fill(0, 1, 10, FillKind::demand); // block 10 returns: -1 for the same features
+  p.on_miss(0, 10); // block 10 returns: -1 for the same features
   REQUIRE(p.stats.protect_wasted == 1);
   REQUIRE(p.stats.evict_bad == 1);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.5 + 0.5 * (-1.0 - 0.5));

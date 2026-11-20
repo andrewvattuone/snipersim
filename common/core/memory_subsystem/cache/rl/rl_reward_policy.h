@@ -23,6 +23,9 @@
  *   protected (passed-over) block hit                    -1
  *   protected block evicted without a hit                +1
  *   coherence / back invalidation, upgrade               none
+ *
+ * Event order on a miss (as in ChampSim, where the tag check precedes find_victim):
+ *   on_miss(set, tag) -> [choose -> commit -> on_eviction(victim)] -> on_fill(set, way, tag, demand)
  */
 
 #include <algorithm>
@@ -148,6 +151,8 @@ struct RewardStats {
   std::array<std::uint64_t, 3> invalidations{}; // by InvalidationReason
   std::uint64_t upgrade_carryovers = 0;         // metadata restored on an upgrade refill
   std::uint64_t upgrade_refills_unmatched = 0;  // upgrade refill without a matching upgrade invalidation
+  std::uint64_t upgrade_stash_overwritten = 0;  // upgrade invalidation while another one in the set awaited its refill
+  std::uint64_t refill_removals = 0;            // history entry found at a fill not preceded by on_miss (expected 0)
 };
 
 // Outcome of choose(): the victim and the candidates older than it that it was preferred over, with their features
@@ -261,7 +266,8 @@ public:
     }
   }
 
-  // A replacement eviction: the victim enters the history; an entry pushed out ages out without returning (+1)
+  // A replacement eviction: the victim enters the history; an entry pushed out ages out without returning (+1).
+  // On a miss, on_miss for the incoming tag must come first (see on_miss).
   void on_eviction(std::uint32_t set, std::uint64_t tag, Features at_decision)
   {
     if (cfg_.mode == Mode::off)
@@ -273,9 +279,27 @@ public:
   }
 
   /*
-   * A block was installed in `way`. Demand fill: if its tag is in the history, the earlier eviction was bad (-1 to the
-   * saved features) and the entry is removed; the way's metadata starts fresh. Upgrade refill: the block never left
-   * from the policy's point of view; its metadata from before the upgrade invalidation is restored, no feedback.
+   * A demand miss on `tag` that will be filled into `set`, reported BEFORE the victim for that fill is chosen. If the
+   * tag is in the history, the earlier eviction was bad: -1 to the saved features, entry removed. This is ChampSim's
+   * order (rl_mesi on_access on the tag check, then find_victim / replacement_cache_fill at the fill), so the victim is
+   * chosen with the -1 already applied and the victim's insertion cannot push out the returning block's entry.
+   * Not called for an upgrade refill (the block was never evicted).
+   */
+  void on_miss(std::uint32_t set, std::uint64_t tag)
+  {
+    if (cfg_.mode == Mode::off)
+      return;
+    if (auto entry = history_.at(set).remove(tag)) {
+      ++stats.evict_bad;
+      reward(set, entry->features, -1.0);
+    }
+  }
+
+  /*
+   * A block was installed in `way`. Demand fill: the way's metadata starts fresh (the history was handled by on_miss).
+   * Upgrade refill: the block never left from the policy's point of view; its metadata from before the upgrade
+   * invalidation is restored, no feedback. A history entry for the tag can only be found here if the fill was not
+   * preceded by on_miss; it is removed silently, as ChampSim's on_fill does, and counted.
    */
   void on_fill(std::uint32_t set, std::uint32_t way, std::uint64_t tag, FillKind kind)
   {
@@ -286,21 +310,15 @@ public:
       auto& p = pending_upgrade_.at(set);
       if (p.valid && p.tag == tag) {
         l = p.meta;
+        p.valid = false;
         ++stats.upgrade_carryovers;
       } else {
-        ++stats.upgrade_refills_unmatched;
+        ++stats.upgrade_refills_unmatched; // a pending upgrade of another block stays pending
       }
-      p.valid = false;
-      history_.at(set).remove(tag); // cannot be present (the block was resident); kept for parity with ChampSim
-      return;
     }
 
-    if (cfg_.mode == Mode::off)
-      return;
-    if (auto entry = history_.at(set).remove(tag)) {
-      ++stats.evict_bad;
-      reward(set, entry->features, -1.0);
-    }
+    if (history_.at(set).remove(tag).has_value())
+      ++stats.refill_removals;
   }
 
   // A hit that updates recency. A protected block that is used again shows the protection was right: -1.
@@ -322,8 +340,14 @@ public:
   {
     ++stats.invalidations.at(static_cast<std::size_t>(reason));
     auto& l = line_(set, way);
-    if (reason == InvalidationReason::upgrade)
-      pending_upgrade_.at(set) = {true, tag, l};
+    if (reason == InvalidationReason::upgrade) {
+      // One pending upgrade per set. A second one before the first refill (possible only if several hardware threads
+      // or cores share this cache, see POLICY_CORES.md) replaces it; the first refill then starts fresh.
+      auto& p = pending_upgrade_.at(set);
+      if (p.valid)
+        ++stats.upgrade_stash_overwritten;
+      p = {true, tag, l};
+    }
     l = LineMeta{};
   }
 };

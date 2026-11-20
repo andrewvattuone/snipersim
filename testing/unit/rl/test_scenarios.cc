@@ -69,46 +69,49 @@ TEST_CASE("scenario: rewards from decisions change later victim selections (modi
   REQUIRE_APPROX(p.weights().state_weight(Mesi::S), -0.253);
   REQUIRE_APPROX(p.weights().share_weight(true), -0.46);
 
-  // Decision 2 (C misses again). The victim is chosen before C's fill is seen: A 0.09, D -0.063, P 0.09, Q 0.09,
-  // tie to the oldest, A. A was protected and never hit: +1 to {M, below}. A enters the history and W ages out: +1 to
-  // {E, below}. Then C's fill finds C in the history: -1 to {E, below}.
+  // Decision 2 (C misses again). C's miss is seen first (ChampSim's tag check): C is in the history, -1 to {E, below},
+  // which also frees C's history slot. Then the victim is chosen with the updated weights: A -0.029, D -0.182,
+  // P -0.029, Q -0.029, tie to the oldest, A. A was protected and never hit: +1 to {M, below}. A takes C's free slot in
+  // the history, so nothing ages out.
   REQUIRE(m.lru_order(0).front() == 0);
   auto r2 = m.fill(0, C, Mesi::E, 1);
   REQUIRE(r2.evicted_tag == A);
   REQUIRE(p.stats.chose_oldest == 1);
-  REQUIRE(p.stats.protect_wasted == 1);
-  REQUIRE(p.stats.evict_good == 2);
   REQUIRE(p.stats.evict_bad == 1);
+  REQUIRE(p.stats.protect_wasted == 1);
+  REQUIRE(p.stats.evict_good == 1);
   REQUIRE_FALSE(p.history(0).contains(C));
   REQUIRE(p.history(0).contains(A));
+  REQUIRE(p.history(0).contains(901)); // W is still there
+  REQUIRE(p.history(0).size() == 16);
+  REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.08);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::M), 0.01);
-  REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.152);
-  REQUIRE_APPROX(p.weights().share_weight(false), 0.20951);
+  REQUIRE_APPROX(p.weights().share_weight(false), 0.1639);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::S), -0.253);
   REQUIRE_APPROX(p.weights().share_weight(true), -0.46);
 
-  // Decision 3 (miss on Z). LRU would evict D; the learned weights now prefer M: D -0.04349, P/Q/R 0.21951.
+  // Decision 3 (miss on Z). LRU would evict D; the learned weights now prefer M: D -0.0891, P/Q/R 0.1739.
   REQUIRE(m.blocks[0][m.lru_order(0).front()].tag == D);
   auto r3 = m.fill(0, Z, Mesi::E, 1);
   REQUIRE(r3.evicted_tag == P);
   REQUIRE(p.line(0, 3).is_protected); // D protected as {S, below}
   REQUIRE(p.line(0, 3).snapshot == S_bt);
-  // P enters the history. C's return removed its entry, so the history had a free slot: nothing ages out and the
-  // weights do not change at this decision.
-  REQUIRE(p.history(0).size() == 16);
+  // P enters the full history and W {E, below} ages out: +1
   REQUIRE(p.history(0).entries().back().tag == P);
+  REQUIRE_FALSE(p.history(0).contains(901));
   REQUIRE(p.stats.evict_good == 2);
-  REQUIRE_APPROX(p.weights().state_weight(Mesi::M), 0.01);
-  REQUIRE_APPROX(p.weights().share_weight(false), 0.20951);
+  REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.172);
+  REQUIRE_APPROX(p.weights().share_weight(false), 0.24751);
   REQUIRE(p.stats.decisions == 3);
 
-  // Decision 4 (miss on 11): the next eviction does push out entry 902 {M, below}: +1
+  // Decision 4 (miss on 11): D -0.00549 is passed over again, Q (M) 0.25751 is evicted; entry 902 {M, below} ages out
   auto r4 = m.fill(0, 11, Mesi::E, 1);
-  REQUIRE(r4.evicted_tag == Q); // D -0.04349 is passed over again; Q (M) 0.21951
+  REQUIRE(r4.evicted_tag == Q);
   REQUIRE(p.line(0, 3).passes == 2);
   REQUIRE(p.stats.evict_good == 3);
   REQUIRE_APPROX(p.weights().state_weight(Mesi::M), 0.109);
-  REQUIRE_APPROX(p.weights().share_weight(false), 0.288559);
+  REQUIRE_APPROX(p.weights().share_weight(false), 0.322759);
+  REQUIRE_APPROX(p.weights().state_weight(Mesi::E), 0.172);
 }
 
 TEST_CASE("scenario: the paper's rules on one set (history M3 E9 S4, AT2 BT14)")

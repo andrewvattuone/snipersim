@@ -12,7 +12,10 @@
  * empty-history logic is unchanged; differences are listed in docs/rl/POLICY_CORES.md:
  *   - the base policy is abstracted as an ordered candidate list (LRU via rl_lru_order.h);
  *   - RL-Both composition is selectable (Combine::And = ChampSim, Combine::Or = the figure read literally);
- *   - the paper's +1/-1 rewards are counted at demand fills (misses), not on every access.
+ *   - the paper's +1/-1 rewards are counted at misses (on_miss), not on every access.
+ *
+ * Event order on a miss (as in ChampSim, where the tag check precedes find_victim):
+ *   on_miss(set, tag) -> [choose -> commit -> on_eviction(victim)] -> on_fill(set, tag)
  *
  * As in the paper, the rewards change nothing directly: the weights are recomputed from the per-set history at
  * every decision, and a -1 acts only by removing the returning block's history entry. No update rule is invented.
@@ -153,9 +156,10 @@ struct PaperStats {
   std::uint64_t first_accepted = 0;     // candidate #1 evicted
   std::uint64_t second_chances = 0;     // candidate #1 kept, candidate #2 evicted unchecked
   std::uint64_t empty_history_decisions = 0;
-  std::uint64_t negative_rewards = 0;   // demand fill of a tag found in the history (-1, entry removed)
-  std::uint64_t positive_rewards = 0;   // demand fill of a tag not in the history (+1, no effect)
+  std::uint64_t negative_rewards = 0;   // miss on a tag found in the history (-1, entry removed)
+  std::uint64_t positive_rewards = 0;   // miss on a tag not in the history (+1, no effect)
   std::uint64_t history_aged_out = 0;   // least recently updated entry dropped to make room
+  std::uint64_t refill_removals = 0;    // entry found at a fill not preceded by on_miss (expected 0 in Sniper)
   std::uint64_t weighted_decisions = 0; // decisions with a non-empty history, for the averages below
   double sum_m = 0, sum_e = 0, sum_s = 0, sum_at = 0, sum_bt = 0;
 };
@@ -240,17 +244,29 @@ public:
   }
 
   /*
-   * A block was installed. Its history entry, if any, is removed ([P24] §II-B). For a demand fill (a miss) the paper's
-   * reward is counted: -1 if the tag was in the history, +1 otherwise. Neither changes a weight directly.
+   * A demand miss on `tag` that will be filled into `set`, reported BEFORE the victim for that fill is chosen (as
+   * ChampSim's tag check precedes its find_victim). A returning evicted block's entry is removed, so the decision and
+   * the victim's insertion see the history without it, and the paper's reward is counted: -1 if the tag was in the
+   * history, +1 otherwise. Neither changes a weight directly ([P24] §II-A/B).
    */
-  void on_fill(std::uint32_t set, std::uint64_t tag, FillKind kind)
+  void on_miss(std::uint32_t set, std::uint64_t tag)
   {
     if (cfg_.mode == Mode::off)
       return;
-    const bool was_in_history = history_.at(set).remove(tag).has_value();
-    if (kind != FillKind::demand)
+    (history_.at(set).remove(tag).has_value() ? stats.negative_rewards : stats.positive_rewards)++;
+  }
+
+  /*
+   * A block was installed. A resident block is never in the history, so this normally finds nothing; an entry is only
+   * found if the fill was not preceded by on_miss (e.g. an upgrade refill of a block whose entry could not exist, or a
+   * missing on_miss call in the adapter). It is removed silently, as ChampSim does at the fill, and counted.
+   */
+  void on_fill(std::uint32_t set, std::uint64_t tag)
+  {
+    if (cfg_.mode == Mode::off)
       return;
-    (was_in_history ? stats.negative_rewards : stats.positive_rewards)++;
+    if (history_.at(set).remove(tag).has_value())
+      ++stats.refill_removals;
   }
 };
 } // namespace rlrepl

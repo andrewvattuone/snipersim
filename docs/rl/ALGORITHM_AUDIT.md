@@ -561,6 +561,11 @@ Sniper hooks needed (default no-op for all existing policies):
 
 Event handling:
 
+> **Corrected after Stage 1 review.** The table below does not fix the order of events on a miss, and the first Stage 1
+> implementation recorded the victim before looking up the incoming block. The incoming block's history lookup
+> (removal and −1) must come **before** the victim for its fill is chosen and recorded, as in ChampSim. See
+> "Event lifecycle of a miss" in [`POLICY_CORES.md`](POLICY_CORES.md#event-lifecycle-of-a-miss).
+
 | Event | History | Reward | Line metadata |
 |---|---|---|---|
 | Fill with eviction (`insert`) | insert victim; aged-out entry → +1 | as in Section 3.1 | reset for new block |
