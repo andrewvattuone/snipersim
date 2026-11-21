@@ -213,6 +213,7 @@
 #include "hooks_manager.h"
 #include "cache_atd.h"
 #include "shmem_perf.h"
+#include "rl_write_oracle.h"
 #include <cstring>
 #include <algorithm>
 
@@ -2109,6 +2110,9 @@ namespace ParametricDramDirectoryMSI
 		case Core::WRITE:
 			m_master->m_cache->accessSingleLine(ca_address + offset, Cache::STORE, data_buf, data_length,
 												getShmemPerfModel()->getElapsedTime(ShmemPerfModel::_USER_THREAD), update_replacement);
+			// RL Stage 4 diagnostics (rl_diag/enabled): record the store for the oracle; observation only
+			if (RlWriteOracle::enabled())
+				RlWriteOracle::noteWrite(ca_address, m_core_id);
 			// Write-through cache - Write the next level cache also
 			if (m_cache_writethrough)
 			{

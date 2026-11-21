@@ -18,6 +18,8 @@
  *               FillKind::upgrade_refill, as Sniper's L2 does for a write to an S/E line
  *
  * It holds no coherence protocol: tests set states and sharer hints directly.
+ *
+ * An optional Stage 4 observer (rl_diagnostics.h) is called before each core call, as the Sniper adapter does.
  */
 
 #include <cstdint>
@@ -25,6 +27,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "rl_diagnostics.h"
 #include "rl_events.h"
 #include "rl_features.h"
 #include "rl_lru_order.h"
@@ -54,6 +57,9 @@ public:
   std::vector<rlrepl::LruOrder> lru;
   std::uint32_t num_cores;
   Policy& policy;
+  static constexpr bool kReward = std::is_same_v<Policy, rlrepl::RewardPolicy>;
+  using Observer = std::conditional_t<kReward, rlrepl::RewardObserver, rlrepl::PaperObserver>;
+  Observer* observer = nullptr; // optional, observation only
 
   SetModel(Policy& p, std::uint32_t sets, std::uint32_t ways, std::uint32_t cores)
       : blocks(sets, std::vector<Block>(ways)), lru(sets, rlrepl::LruOrder{ways}), num_cores(cores), policy(p)
@@ -84,8 +90,11 @@ public:
                   rlrepl::FillKind kind = rlrepl::FillKind::demand)
   {
     FillResult r;
-    if (kind == rlrepl::FillKind::demand)
+    if (kind == rlrepl::FillKind::demand) {
+      if (observer)
+        observer->before_miss(policy, set, tag);
       policy.on_miss(set, tag);
+    }
     auto& ways = blocks.at(set);
     std::optional<std::uint32_t> invalid;
     for (std::uint32_t w = 0; w < ways.size() && !invalid; ++w)
@@ -99,12 +108,20 @@ public:
       const auto candidates = lru_order(set);
       if constexpr (std::is_same_v<Policy, rlrepl::RewardPolicy>) {
         auto d = policy.choose(set, candidates, info);
+        if (observer)
+          observer->observe_decision(policy, set, candidates, info, d);
         policy.commit(set, d);
+        if (observer)
+          observer->before_eviction(policy, set, ways[d.victim].tag, d.victim_features);
         policy.on_eviction(set, ways[d.victim].tag, d.victim_features);
         r.way = d.victim;
       } else {
         auto d = policy.choose(set, candidates, info);
+        if (observer)
+          observer->observe_decision(policy, set, d);
         policy.commit(d);
+        if (observer)
+          observer->before_eviction(policy, set, ways[d.victim].tag);
         policy.on_eviction(set, ways[d.victim].tag, d.victim_features);
         r.way = d.victim;
       }
@@ -113,18 +130,28 @@ public:
     }
     lru.at(set).touch(r.way);
     ways[r.way] = Block{true, tag, state, hint};
-    if constexpr (std::is_same_v<Policy, rlrepl::RewardPolicy>)
+    if constexpr (kReward) {
+      if (observer)
+        observer->before_fill(policy, set, r.way, tag, kind);
       policy.on_fill(set, r.way, tag, kind);
-    else
+    } else {
+      if (observer)
+        observer->before_fill(set, r.way, tag, kind);
       policy.on_fill(set, tag);
+    }
     return r;
   }
 
   void hit(std::uint32_t set, std::uint32_t way)
   {
     lru.at(set).touch(way);
-    if constexpr (std::is_same_v<Policy, rlrepl::RewardPolicy>)
+    if constexpr (kReward) {
+      if (observer)
+        observer->before_hit(policy, set, way);
       policy.on_hit(set, way);
+    } else if (observer) {
+      observer->before_hit(set, way);
+    }
   }
 
   void hit_tag(std::uint32_t set, std::uint64_t tag) { hit(set, find(set, tag).value()); }
@@ -132,8 +159,13 @@ public:
   void invalidate(std::uint32_t set, std::uint32_t way, rlrepl::InvalidationReason reason)
   {
     auto& b = blocks.at(set).at(way);
-    if constexpr (std::is_same_v<Policy, rlrepl::RewardPolicy>)
+    if constexpr (kReward) {
+      if (observer)
+        observer->before_invalidate(policy, set, way, b.tag, reason);
       policy.on_invalidate(set, way, b.tag, reason);
+    } else if (observer) {
+      observer->before_invalidate(set, way, b.tag);
+    }
     b.valid = false;
   }
 

@@ -147,6 +147,42 @@ migration invalidates the previous M owner with a writeback (p, K = 2); an L3
 eviction back-invalidates all four S copies and sends INV_REP to the directory
 (r, K = 4, 512 KB L3).
 
+#### Near-threshold failure with `sf_lru` on the L2 (RL Stage 4)
+
+The program is deterministic, but the two simulations of a pair are not: each delta also
+contains the run-to-run variation of the other activity of the run. One check failed
+once in 26 Gainestown 2-core pairs run during the RL Stages 3 and 4 (LRU, `rl_lru`, `sf_lru`):
+
+* **Run:** `run_regress.sh s4-sf-g2 -n 2 -c gainestown`, L2 `replacement_policy=sf_lru` with
+  `rl_diag/enabled=true`, clean case.
+* **Failed check:** `core0 L1-D load misses`, write 2398 − read 2169 = 229 < 0.9 × 256 = 230.4.
+* **Passing checks of the same pair:**
+  * copies removed by coherence: core 0 L1-D +254, L2 +254;
+  * core 0 L2 load misses +257; core 1 L2 downgrades +253;
+  * `data check: OK` in both runs; 0 stale write hits (`SNIPER_COHERENCE_CHECK=1`);
+  * `check_rl_events.py --regress`: classified correctly;
+  * the one-line traced copy of the run shows the expected sequence: E, S/S, core 0 invalidated by core 1's
+    upgrade, core 1 M, core 0 misses and core 1 is downgraded to S.
+
+**Why it is the threshold, not coherence.** The RL diagnostics classify every demand miss of the L2 by how the
+line last left. Core 0's L2 had +252 demand misses on lines it had lost to a coherence invalidation (write
+266, read 14). Prefetchers are off and only data lines are written, so each of these came from an L1-D miss on
+a regression line. The rest of core 0's L1-D load misses were 23 lower in the write run (2132 against 2155).
+That unrelated variation, not missing coherence misses, put the total below the bar.
+
+In the six pairs with diagnostics the coherence component was 252–257 every time, while the unrelated L1-D
+misses differed by −23 to +19. Over all 26 pairs the delta was 229–274 (mean 250): LRU 236–259, `rl_lru`
+252–265, `sf_lru` 229–274. Eight repeats of the failing configuration, four with diagnostics and four without,
+passed (237–274).
+
+**Unresolved.**
+* The failing interleaving cannot be replayed: multicore runs are not reproducible.
+* The L1-D step-4 misses are inferred from the L2 classification and the absence of prefetchers; they are not
+  counted per line at the L1-D.
+* With about 26 lines of margin and about ±25 of noise in the totals, this check (and the other totals-based
+  rows) can fail by chance. The thresholds are left unchanged. Counting the step-4 misses on the regression
+  lines directly would remove the noise; that would be a change to the test and is not made here.
+
 ### Coherence check (`SNIPER_COHERENCE_CHECK=1`)
 
 Write hits in a private cache while another core's private copy exists below the same

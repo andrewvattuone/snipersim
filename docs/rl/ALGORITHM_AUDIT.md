@@ -9,7 +9,7 @@ ChampSim implementations actually do, every issue found, and the agreed plan. No
 | Date | 2026-11-20 |
 | Sniper baseline | `27e0d326` (MESI fill fix, delivered sharer hint, presence tracking; see `experiments/sharer-counts/COHERENCE_VALIDATION.md`) |
 | ChampSim reference | `SCU-Senior-Design-Project`, branch `mesi-implementation`, `148b9c3` (read-only) |
-| Status | Stages 1-3 implemented (cores and unit tests, Sniper event hooks, `sf_lru` / `rl_lru` policies): see [`POLICY_CORES.md`](POLICY_CORES.md). Stages 4+ not started |
+| Status | Stages 1-4 implemented (cores and unit tests, Sniper event hooks, `sf_lru` / `rl_lru` policies, diagnostics): see [`POLICY_CORES.md`](POLICY_CORES.md). Stages 5+ not started |
 
 Paths in this document:
 

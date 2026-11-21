@@ -3,7 +3,8 @@
 Stage 1 of the Sniper port: the two replacement algorithms as simulator-independent, header-only C++ cores with
 deterministic unit tests. Stage 2: Sniper reports classified cache events to its cache sets through no-op hooks.
 Stage 3: both cores are selectable Sniper replacement policies, `sf_lru` and `rl_lru` (see
-[Sniper integration](#sniper-integration)). `CacheSetLRU`, `CacheSetSRRIP`, the MESI protocol and the sharer-hint code
+[Sniper integration](#sniper-integration)). Stage 4: optional, observation-only diagnostics for the open issues (see
+[Diagnostics](#diagnostics-stage-4)). `CacheSetLRU`, `CacheSetSRRIP`, the MESI protocol and the sharer-hint code
 are unchanged. The audit that motivates every decision here is
 [`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) (issue numbers I-n refer to it).
 
@@ -25,6 +26,7 @@ new into Sniper; names are prefixed because every directory under `common/` is o
 | `rl_lru_order.h` | `LruOrder`: candidate generation with Sniper `CacheSetLRU`'s exact rank semantics |
 | `rl_paper_policy.h` | `PaperPolicy`: ratio weights, rule text/example, AND/OR, next attempt |
 | `rl_reward_policy.h` | `RewardPolicy`: `WeightTable`, EMA rewards, highest-score-among-N, protection feedback |
+| `rl_diagnostics.h` | Stage 4 observers `RewardObserver`, `PaperObserver` (read-only, see [Diagnostics](#diagnostics-stage-4)) |
 
 Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build):
 
@@ -37,6 +39,7 @@ Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build)
 | `test_reward_policy.cc` | Reward core (ports ChampSim test 447) |
 | `test_scenarios.cc` | End-to-end deterministic scenarios |
 | `test_event_order.cc` | Regression tests for the order of events on a miss (history lookup before the eviction) |
+| `test_diagnostics.cc` | Stage 4 observers: no decision changes, totals equal the cores' counters, runs, ties, double rewards |
 | `Makefile`, `.gitignore` | Build/run; the test binary is ignored |
 
 ## Running the tests
@@ -47,7 +50,7 @@ testing/unit/rl/rl_unit_tests paper    # only test cases whose name contains "pa
 make -C testing/unit/rl clean
 ```
 
-Expected: `63 test cases, 0 failed, 643 assertions`.
+Expected: `71 test cases, 0 failed, 844 assertions`.
 
 ## Architecture
 
@@ -277,6 +280,7 @@ events happen in Sniper's order.
 the controller's classification. All hooks are no-ops in the base class, so every existing policy, including
 `CacheSetLRU`, behaves exactly as before. **Stage 3 (implemented)** adds the `CacheSetRL` adapter, which implements the
 hooks with the cores, and registers the policy names `sf_lru` and `rl_lru` (see [Policies](#policies-sf_lru-and-rl_lru)).
+**Stage 4 (implemented)** adds optional diagnostics (see [Diagnostics](#diagnostics-stage-4)).
 
 ### Hooks (`cache/cache_set.h`, `cache/cache_set_events.h`)
 
@@ -445,16 +449,90 @@ With `--regress WRITE READ N` it also checks that a `coherence_regress` write ma
 lines in its L1-D (and in its L2 when that is not the last level) while the other core's copies are invalidated by
 coherence.
 
+### Diagnostics (Stage 4)
+
+Measurements for the open issues, off by default. They change no decision: the observers only read the cores, and
+the oracle only reads simulator state.
+
+```
+-g perf_model/l2_cache/rl_diag/enabled=true            # default false: nothing below is computed or registered
+-g perf_model/l2_cache/rl_diag/snapshot_interval=1000  # full-set decisions per snapshot row; 0 = no snapshot file
+```
+
+Both keys apply to `sf_lru` and `rl_lru`. Each cache prints `[RL] L2 core 0: diagnostics on, ...` at start-up.
+`experiments/sharer-counts/check_rl_policy.py RUN...` checks a run, and `--summary` prints the measurements below.
+
+**How it works.**
+
+* **Observers** (`rl/rl_diagnostics.h`, simulator-independent and unit-tested). `CacheSetRL` calls a
+  `RewardObserver` or `PaperObserver` immediately before each core call, with the same arguments. An observer reads
+  the core through its const accessors only. Where it predicts what the core is about to do (which history entry ages
+  out, whether a victim is protected), the per-class totals must equal the core's own counters, and
+  `check_rl_policy.py` checks this on every run.
+* **Miss classification** (adapter). Each cache remembers how every line last left it (replaced, coherence
+  invalidation, back invalidation; an upgrade comes back with its refill). Each demand miss is then cold, replaced and
+  still in the history, replaced and aged out, coherence, or back invalidation. The map holds only lines that left and
+  have not returned.
+* **Write oracle** (`cache/rl_write_oracle.{h,cc}`). Every data store is recorded where the L1 performs it
+  (`CacheCntlr::accessCache`, after write permission was obtained), with a global sequence number. This one guarded
+  line is the only controller change; it sends no message, charges no time and is skipped unless a cache enabled the
+  diagnostics. Since a write needs M and M excludes every other copy, the oracle answers exactly:
+  * I-2: did another core write the line after this cache evicted it?
+  * I-3: did this core write a line it holds in M while it was resident?
+* **Snapshots.** `rl-snapshots-<cache>-<core>.csv` (moved to `telemetry/` by `run-sniper`) has one row every
+  `snapshot_interval` full-set decisions: decisions, instructions of the cache's core, whether the region of interest
+  is active, then
+  * `rl_lru`: the weights (per-set scope: mean over sets), the four reward counters, passes, max passes, ties, small
+    margins and ranking flips;
+  * `sf_lru`: the cache-wide history composition (fractions M/E/S of known states, AT) and the decision and reward
+    counters.
+
+**Statistics** (prefix `rl-diag-` or `sf-diag-`, per cache and core; region-of-interest deltas like all statistics):
+
+| Issue | Statistic | Meaning |
+|---|---|---|
+| I-1 | `run-{hit,evicted,invalidated}-{1,2,3-4,5-8,9-16,17-32,33+}` | Runs of consecutive passes (`rl`) or rejections as candidate #1 (`sf`) of one block, by how the run ended. A run survives an upgrade with the block's metadata (`rl`); `sf` ends it there |
+| I-1 | `run-ended-passes` | Sum of the lengths of the ended runs. A run restarts at a hit; `rl-max-passes` counts every pass during a residency, so it can exceed the longest run |
+| I-1 | `pinned-short-sum`, `pinned-long-sum` | Sum over decisions of the ways in the set with a current run ≥ 2 / ≥ 8; divided by `decisions`, the mean number of pinned ways |
+| I-4 | `all-tied`, `tied-distinct`, `small-margin` (`rl`) | Decisions whose window scores were all equal; ... although the candidates' features differed; features differed and best − worst < 0.01 |
+| I-4 | `flips-state`, `flips-sharing` (`rl`) | Decisions at which the order of wS/wE/wM (wBT/wAT) differs from the previous decision on the same weight table |
+| I-4 | `reward-<kind>-{S,E,M,BT,AT}` (`rl`) | The four rewards by the features they trained |
+| I-6 | `double-agree`, `double-contradict`, `double-snapshot-differs` (`rl`) | A protect-wasted (+1) block whose history entry later aged out (+1) or returned (−1); the +1 trained other features than the eviction recorded |
+| | `victim-position-0..7` (`rl`) | The victim's window position (0 = LRU way, so `victim-position-0` = `rl-chose-oldest`) |
+| | `history-hit-*`, `aged-out-*` (`sf`) | Returning blocks (−1) and aged-out entries by the class of their history entry |
+| | `misses`, `miss-{cold,replaced-in-history,replaced-not-in-history,coherence,back-invalidation}` | Demand-miss classification |
+| I-2 | `miss-replaced-in-history-other-write`, `-not-in-history-other-write`, `history-hit-other-write-{S,E,M,BT,AT}` | Replacement misses where another core wrote the line after the eviction: the copy would have been invalidated anyway, yet `rl` gives −1 |
+| I-3 | `victims-M`, `victims-M-unwritten` | M victims; those this core never wrote while resident (M granted on a read) |
+| | `decisions`, `miss-inconsistent`, `double-dropped` | Cross-checks: equal to the core's decisions; 0; 0 |
+
+**Validated** (Stage 4):
+* The unit tests replay random traces with and without an observer and require identical victims and closed totals.
+* Single-core FFT trace replay, eleven L2 configurations, 8 MB and 512 KB L3: Stage 3's exact victim sequence with
+  diagnostics on and off. Every other statistic is identical apart from the jittery `L3.store-overlapping-misses`
+  (see [Known limitations](#known-limitations-and-open-questions)).
+* Every run with an RL policy passes `check_rl_policy.py` and `check_rl_events.py`, and the coherence regressions with
+  diagnostics on are MESI-consistent and correctly classified.
+
+**Limits of the diagnostics.**
+
+* Pinned ways are sampled at decisions, not weighted by time.
+* The oracle sees the stores that go through an L1's `accessCache`. Writes from an accelerator port below the L1
+  (`mem_origin` `ACCEL_L2` / `ACCEL_LLC`, `cache_cntlr.cc`, unused in these runs) are not recorded. All caches using
+  the oracle must have one line size (asserted).
+* `run-*` counts a run when it ends, so a run that started before the region of interest counts in full.
+* Host memory: the departure map keeps one entry per line that left a cache and has not returned, and the oracle one
+  record per line ever written. Both grow with the footprint; fine for diagnostic runs, not meant for long sweeps.
+
 ## Known limitations and open questions
 
 * **Repeated protection (I-1).** A low-scoring dead block can be passed over at every miss without ever producing a
-  reward (test "a low-scoring dead block is passed over…"). The paper core likewise re-rejects a block left at the LRU
-  position. Measured, not fixed, until Stage 4 data exist.
+  reward. Tracked under [Outstanding issues](#repeated-protection-audit-i-1).
 * **Double reward for protected blocks (I-6).** Ported as is (test "protected blocks receive a protection reward and
   later a history reward").
 * **Coherence misses after eviction (I-2)** still count as bad evictions. Nothing in the core can see them; a Stage 4
   oracle diagnostic will measure how often.
-* **Global weights with alpha = 0.1 (I-4)** adapt very quickly; per-set scope and alpha are parameters for the later sweep.
+* **Global weights with alpha = 0.1 (I-4)** adapt very quickly and can saturate. Tracked under
+  [Outstanding issues](#weight-saturation-audit-i-4).
 * **Ties.** The paper core counts ties as highest, so a three-way state tie keeps (example) or evicts (text) every
   candidate #1.
 * **Paper ambiguities** kept as options: rule, combine, retain (only `stay` implemented, as approved). The
@@ -475,11 +553,16 @@ coherence.
   * **Single core.** With one core the threshold is "> 0 of 1", so every block with a hint is above it and the sharing
     feature is constant. `sf_lru` with `example` + `and` then never accepts candidate #1, because the class check always
     says keep. That is the AND/OR ambiguity (I-9), not a bug; `or` behaves differently.
-  * **Weight saturation.** In `sharetest` the global weights of `rl_lru` saturate near −1 within a short run, because
-    most evicted blocks return quickly. With all weights equal the policy falls back to LRU order (I-4).
-  * **Repeated protection.** `rl-max-passes` reached 26 in `sharetest u`, the repeated protection of audit I-1.
+  * **Weight saturation** and **repeated protection** (`rl-max-passes` up to 26): see
+    [Outstanding issues](#outstanding-issues-and-future-work).
 * **Auxiliary tag directory.** `cache_atd.cc` builds its sets without a `Cache`, so it cannot size an RL core. The RL
   policies stop with a configuration error there.
+* **Run-to-run jitter in `L3.store-overlapping-misses`** (and `-data`). Even for single-core trace replay this
+  counter varies by ±1–2 between runs of the same binary (Stage 3 binary repeated: 5, 4, 4), while the victim sequence
+  and every other statistic stay identical. It is pre-existing and must be excluded from exact comparisons.
+* **`coherence_regress` totals are noisy.** One Stage 4 pair (`sf_lru`, 2 cores, clean) missed the
+  `core0 L1-D load misses` bar by 1.4 lines while every coherence count passed. The analysis is in
+  `experiments/sharer-counts/COHERENCE_VALIDATION.md` ("Near-threshold failure"); thresholds unchanged.
 * **The SRRIP baseline needs `srrip/bits`** (and `srrip/tlb_enabled`), which `gainestown.cfg` does not define. This is
   pre-existing and unrelated to the RL policies.
 
@@ -518,3 +601,66 @@ alongside the ordering fix; previously it cleared the slot.
 **Recommendation.** Keep the single slot for the Stage 2 target, and check `upgrade_stash_overwritten == 0` in the
 integration tests. Before using the policy in SMT or shared non-last-level configurations, replace the slot with a small
 per-set list of pending upgrades keyed by tag, at most one per hardware thread sharing the cache.
+
+## Outstanding issues and future work
+
+The three concerns below are tracked here until they are resolved; the audit entries ([`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md),
+Section 5) keep the analysis. None of them may be fixed by changing the learning algorithm before its Stage 4 data
+have been reviewed.
+
+### No eligible victim: fallback to way 0
+
+* **Status.** Open, not expected in the current target. When every way of a full set is `SHARED_UPGRADING`,
+  `CacheSetRL::getReplacementIndex` has no candidate and returns way 0, the same fallback as `CacheSetLRU` (whose
+  search also starts at index 0). Evicting a way in the middle of an upgrade may break the protocol. The state only
+  exists while a last-level cache upgrades a line in place, so the private L2 never produces it; no Stage 3 or
+  Stage 4 run observed it.
+* **Detection.** `rl-no-eligible-victim` / `sf-no-eligible-victim` count every fallback and must stay 0 in every run.
+  `experiments/sharer-counts/check_rl_policy.py` fails a run otherwise, and the Stage 2 checker independently fails on
+  any `SHARED_UPGRADING` victim (`rl-event-victim-upgrading`).
+* **Revisit.** Before an RL policy is used on a shared last-level cache, a shared non-last-level cache or with SMT,
+  and immediately if a counter is ever non-zero. The proper handling (stop with an error, or let the controller retry
+  the fill once the upgrade completes) has to be decided with the controller, not inside the policy.
+
+### Weight saturation (audit I-4)
+
+* **Status.** Observed, not characterized. In Stage 3 `sharetest` runs the global weights of `rl_lru` approached −1
+  within a short run, because most evicted blocks return while still in the history. Weights that are all near −1
+  stop separating classes, and the choice degenerates to LRU order. Learning algorithm unchanged (α = 0.1, global
+  scope).
+* **Measurement (Stage 4).** Periodic weight snapshots per cache (`rl_diag/snapshot_interval`); decisions whose
+  window candidates have different features but equal or nearly equal scores (`rl-diag-tied-distinct`,
+  `rl-diag-small-margin`); ranking changes between decisions (`rl-diag-flips-state`, `rl-diag-flips-sharing`); rewards by type and
+  feature class, which show which outcomes drive the weights.
+* **First Stage 4 measurements** (small functional runs, one repetition each; indications, not results).
+  * With snapshots every 100 decisions, the weights of the writing core in 4-core `sharetest u`/`w` move between −1
+    and +1 several times per run. No snapshot had every trained weight saturated, but the end-of-run values were near
+    −1. A single end-of-run value is therefore not a summary of the weights.
+  * The other cores' L2s received no reward for their first 1,000–1,600 decisions. The weights stayed 0 and every
+    decision was LRU's: 27–67% of their decisions are ties between candidates with different features.
+  * Single-core FFT replay: wE, wM and wAT end at −1.000. Only 0.2% of decisions are ties between different
+    features and 0.9% have a margin below 0.01, so saturation rarely removed a distinction there.
+* **Revisit.** With the Stage 4 data, before the α and weight-scope sweeps (Stage 7). Changes to the update rule are
+  out of scope until then.
+
+### Repeated protection (audit I-1)
+
+* **Status.** Observed, effect unknown. A block passed over by a decision keeps its LRU position, so it can be passed
+  over again at every miss without producing any reward; `rl-max-passes` reached 26 in Stage 3 (`sharetest u`). The
+  paper reproduction has the same property for a rejected candidate #1. No protection limit is implemented.
+* **Measurement (Stage 4).** Histograms of consecutive passes (`rl_lru`) or rejections (`sf_lru`) of one block, by how
+  the run ended (hit, eviction, invalidation); the number of ways in the set with long runs at each decision (pinned
+  ways); `rl-max-passes`; the double reward a protected block can receive (I-6).
+* **First Stage 4 measurements** (small functional runs, as above).
+  * `rl_lru`, single-core FFT replay: 21.5% of pass runs reach ≥ 5 passes (maximum 10), and most runs end with the
+    block's eviction.
+  * `rl_lru`, 4-core `sharetest` (`u` and `w`, two runs each): long runs are rare (2–3.5% ≥ 5 on the writing core).
+    Of the 57 longest runs (17–32 passes), 54 ended in an invalidation and 3 in an eviction, so they produced almost no
+    reward. `rl-max-passes` was 23–26 there.
+  * `sf_lru`, single-core FFT replay: 60% (text) and 87% (example) of rejection runs reach ≥ 5. Under `example` + AND
+    on one core, candidate #1 is never accepted (I-9).
+  * I-6, single core: of 12,236 protect-wasted (+1) rewards, 9,843 were contradicted by the block's return (−1) and
+    1,108 confirmed by its entry ageing out.
+* **Revisit.** With the Stage 4 data, together with I-4 (saturated weights make passing over less frequent, distinct
+  weights make it more frequent). A pass cap or promotion is a later algorithm option, evaluated against the current
+  behavior, not a default change.

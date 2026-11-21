@@ -14,17 +14,65 @@
  * hint-*, access-mru-*). CacheSetRL is one set: it keeps that set's LRU order (rlrepl::LruOrder, the same ranks as
  * CacheSetLRU) and connects the Stage 2 event hooks to the core. All decisions use the block's own coherence state and
  * its delivered sharer hint; the oracle sharer count is only recorded for diagnostics, as with LRU.
+ *
+ * Stage 4 diagnostics (rl_diag/enabled = true, default off): RlDiagnostics holds the core observer
+ * (rl/rl_diagnostics.h), the miss classification, the write-oracle checks (rl_write_oracle.h) and the weight
+ * snapshot file. All of it is observation only: decisions are identical with diagnostics on or off.
  */
 
 #include "cache_set.h"
 #include "cache_set_lru.h"
 #include "lock.h"
+#include "rl_diagnostics.h"
 #include "rl_lru_order.h"
 #include "rl_paper_policy.h"
 #include "rl_reward_policy.h"
 
+#include <cstdio>
 #include <memory>
+#include <unordered_map>
 #include <vector>
+
+// Stage 4 diagnostics of one cache (see docs/rl/POLICY_CORES.md, "Diagnostics"); used under CacheSetInfoRL::lock()
+struct RlDiagnostics
+{
+   std::unique_ptr<rlrepl::RewardObserver> reward; // rl_lru
+   std::unique_ptr<rlrepl::PaperObserver> paper;   // sf_lru
+   core_id_t core_id = INVALID_CORE_ID;
+
+   // How a line last left this cache, and the write-oracle sequence number at that moment
+   enum departure_t : UInt8 { REPLACED, COHERENCE, BACK_INVALIDATION };
+   struct Departure
+   {
+      departure_t how;
+      UInt64 seq;
+   };
+   std::unordered_map<IntPtr, Departure> departed; // by tag: lines that left and have not come back
+
+   // Demand misses (onMiss) by why the line was not here
+   struct Misses
+   {
+      UInt64 total = 0;
+      UInt64 cold = 0;                       // never held by this cache
+      UInt64 replaced_in_history = 0;        // evicted, still in the history: the policy is blamed (-1)
+      UInt64 replaced_not_in_history = 0;    // evicted, entry aged out (or mode off)
+      UInt64 coherence = 0;                  // invalidated by another core's write
+      UInt64 back_invalidation = 0;          // invalidated by the inclusive next level
+      UInt64 replaced_in_history_other_write = 0;     // ... another core wrote the line after the eviction (I-2)
+      UInt64 replaced_not_in_history_other_write = 0;
+      UInt64 inconsistent = 0;               // in the history but last left otherwise (expect 0)
+   } misses;
+   rlrepl::ClassCounts history_hit_other_write; // replaced_in_history_other_write by the history entry's features
+
+   // Victims in M (audit I-3): M from a read fill and never written by this core while resident
+   UInt64 victims_m = 0;
+   UInt64 victims_m_unwritten = 0;
+
+   // Periodic snapshots of the weights and counters, one CSV row every snapshot_interval full-set decisions
+   UInt64 snapshot_interval = 0;
+   FILE *snapshots = nullptr;
+   UInt64 snapshot_rows = 0;
+};
 
 class CacheSetInfoRL : public CacheSetInfoLRU
 {
@@ -44,6 +92,12 @@ class CacheSetInfoRL : public CacheSetInfoLRU
       rlrepl::PaperPolicy &paper() { return *m_paper; }
       rlrepl::RewardPolicy &reward() { return *m_reward; }
       Lock &lock() { return m_lock; }
+      RlDiagnostics *diag() { return m_diag.get(); } // null unless rl_diag/enabled
+
+      // Weights for the statistics and snapshots: the global table, or the mean over the sets (per-set scope)
+      double meanWeight(int what) const;
+      // One snapshot row (caller holds lock())
+      void writeSnapshot();
 
       // Adapter statistics (prefixed sf- or rl-)
       struct AdapterStats
@@ -72,8 +126,11 @@ class CacheSetInfoRL : public CacheSetInfoLRU
       std::unique_ptr<rlrepl::RewardPolicy> m_reward;
       Lock m_lock;
       std::vector<StatSource *> m_stat_sources;
+      std::unique_ptr<RlDiagnostics> m_diag;
 
       void registerStats(String name, core_id_t core_id);
+      void setupDiagnostics(String name, String cfgname, core_id_t core_id, UInt32 associativity, UInt32 num_sets);
+      void registerDiagnosticStats(String name, core_id_t core_id);
 };
 
 class CacheSetRL : public CacheSet
@@ -107,7 +164,13 @@ class CacheSetRL : public CacheSet
          rlrepl::Features features{};
       } m_pending;
 
-      rlrepl::Features features(UInt32 way);
+      // Write-oracle sequence number when each way was filled (diagnostics only)
+      std::vector<UInt64> m_fill_seq;
+
+      rlrepl::Features features(UInt32 way);          // counts candidate-state-unknown
+      rlrepl::Features featuresOf(UInt32 way) const;  // no side effect (diagnostics)
+      IntPtr addressOf(IntPtr tag) const { return tag * m_blocksize; }
+      void classifyMiss(RlDiagnostics &d, IntPtr tag);
       static UInt32 registerWith(CacheSetInfoRL *set_info);
 };
 
