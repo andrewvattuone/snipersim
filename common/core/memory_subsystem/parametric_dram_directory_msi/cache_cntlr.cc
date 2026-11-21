@@ -202,6 +202,7 @@
 
 #include "cache_cntlr.h"
 #include "line_tracer.h"
+#include "line_watch.h"
 #include "debug_config.h"
 #include "log.h"
 #include "memory_manager.h"
@@ -2199,6 +2200,11 @@ namespace ParametricDramDirectoryMSI
 		if (LineTracer::matchesPhysical(address))
 			LineTracer::print("  %s c%d INVALIDATE (was %c, %s)", MemComponentString(m_mem_component), m_core_id, CStateString(old_cstate),
 				CacheSetEvent::invalidationName(reason));
+		if (LineWatch::active())
+			LineWatch::note(m_mem_component, m_core_id, address,
+				reason == CacheSetEvent::INV_COHERENCE ? LineWatch::INV_COHERENCE
+				: reason == CacheSetEvent::INV_BACK_INVALIDATION ? LineWatch::INV_BACK_INVALIDATION
+				: reason == CacheSetEvent::INV_UPGRADE ? LineWatch::INV_UPGRADE : LineWatch::INV_OTHER, CStateString(old_cstate));
 
 		if (m_next_cache_cntlr)
 			m_next_cache_cntlr->notifyPrevLevelEvict(m_core_id_master, m_mem_component, address);
@@ -2253,6 +2259,13 @@ namespace ParametricDramDirectoryMSI
 				CacheSetEvent::fillName(fill));
 		if (eviction && LineTracer::matchesPhysical(evict_address))
 			LineTracer::print("  %s c%d EVICT (was %c)", MemComponentString(m_mem_component), m_core_id, CStateString(evict_block_info.getCState()));
+		if (LineWatch::active())
+		{
+			if (eviction) // the victim leaves before the new line is installed
+				LineWatch::note(m_mem_component, m_core_id, evict_address, LineWatch::EVICTION, CStateString(evict_block_info.getCState()));
+			LineWatch::note(m_mem_component, m_core_id, address, fill == CacheSetEvent::UPGRADE_REFILL ? LineWatch::FILL_UPGRADE_REFILL : LineWatch::FILL_DEMAND,
+				CStateString(cstate));
+		}
 
 		if (Sim()->getInstrumentationMode() == InstMode::CACHE_ONLY)
 			cache_block_info->setOption(CacheBlockInfo::WARMUP);
@@ -2448,6 +2461,9 @@ namespace ParametricDramDirectoryMSI
 		if (cache_block_info && LineTracer::matchesPhysical(address))
 			LineTracer::print("  %s c%d UPDATE %c -> %c (%s)", MemComponentString(m_mem_component), m_core_id,
 				CStateString(old_cstate), CStateString(new_cstate), LineTracer::reasonName(reason));
+		if (cache_block_info && LineWatch::active() && new_cstate == CacheState::SHARED
+			&& (old_cstate == CacheState::MODIFIED || old_cstate == CacheState::EXCLUSIVE || old_cstate == CacheState::OWNED))
+			LineWatch::note(m_mem_component, m_core_id, address, LineWatch::DOWNGRADE, CStateString(new_cstate));
 
 		bool buf_written = false, is_writeback = false;
 

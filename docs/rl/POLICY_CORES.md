@@ -4,8 +4,9 @@ Stage 1 of the Sniper port: the two replacement algorithms as simulator-independ
 deterministic unit tests. Stage 2: Sniper reports classified cache events to its cache sets through no-op hooks.
 Stage 3: both cores are selectable Sniper replacement policies, `sf_lru` and `rl_lru` (see
 [Sniper integration](#sniper-integration)). Stage 4: optional, observation-only diagnostics for the open issues (see
-[Diagnostics](#diagnostics-stage-4)). `CacheSetLRU`, `CacheSetSRRIP`, the MESI protocol and the sharer-hint code
-are unchanged. The audit that motivates every decision here is
+[Diagnostics](#diagnostics-stage-4)). Stage 5: functional and coherence validation with both policies enabled
+([`STAGE5_VALIDATION.md`](STAGE5_VALIDATION.md)). `CacheSetLRU`, `CacheSetSRRIP`, the MESI protocol and the
+sharer-hint code are unchanged. The audit that motivates every decision here is
 [`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) (issue numbers I-n refer to it).
 
 | Algorithm | Core | Reference implementation (ChampSim, `mesi-implementation` `148b9c3`) |
@@ -504,6 +505,7 @@ Both keys apply to `sf_lru` and `rl_lru`. Each cache prints `[RL] L2 core 0: dia
 | I-2 | `miss-replaced-in-history-other-write`, `-not-in-history-other-write`, `history-hit-other-write-{S,E,M,BT,AT}` | Replacement misses where another core wrote the line after the eviction: the copy would have been invalidated anyway, yet `rl` gives −1 |
 | I-3 | `victims-M`, `victims-M-unwritten` | M victims; those this core never wrote while resident (M granted on a read) |
 | | `decisions`, `miss-inconsistent`, `double-dropped` | Cross-checks: equal to the core's decisions; 0; 0 |
+| | `evicted-{S,E,M,BT,AT}`, `eviction-features-changed` | Features recorded into the history at each eviction (checked against `lru-victim-*` and the delivered-hint `hint-victim-heavy-*` counts); evictions whose block changed since its decision (expect 0) |
 
 **Validated** (Stage 4):
 * The unit tests replay random traces with and without an observer and require identical victims and closed totals.

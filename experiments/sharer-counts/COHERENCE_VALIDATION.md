@@ -180,8 +180,72 @@ passed (237–274).
 * The L1-D step-4 misses are inferred from the L2 classification and the absence of prefetchers; they are not
   counted per line at the L1-D.
 * With about 26 lines of margin and about ±25 of noise in the totals, this check (and the other totals-based
-  rows) can fail by chance. The thresholds are left unchanged. Counting the step-4 misses on the regression
-  lines directly would remove the noise; that would be a change to the test and is not made here.
+  rows) can fail by chance. The thresholds are left unchanged. Stage 5 added the per-line check below, which
+  examines the regression lines directly.
+
+#### Per-line check (RL Stage 5)
+
+**Aggregate check (unchanged).** The rows above compare whole-run totals of core 0 and core 1 between the
+write run and its read control, and require 90% of N on each delta. Their thresholds are kept. They
+include every other access of the two runs, so they can miss the bar without a coherence error (above).
+They also assume the N lines stay resident in the private caches between the steps. A replacement policy
+that evicts some of them, as `rl_lru` does in silvermont's 24 KB L1-D, lowers the coherence deltas
+legitimately: an evicted copy needs no invalidation.
+
+**Instrumentation.** `run_regress.sh` runs the write/read pairs with `SNIPER_WATCH_VADDR` /
+`SNIPER_WATCH_LINES` set to the regression lines. The line watch
+(`common/core/memory_subsystem/parametric_dram_directory_msi/line_watch.{h,cc}`) is test
+instrumentation, separate from the replacement policies:
+* It is off unless those variables are set, and changes no state, message or timing.
+* It maps each watched virtual line to its physical line before the first access.
+* It records every fill (with the state granted), downgrade, invalidation (by reason) and eviction of those lines
+  in every cache. Each record gets a sequence number taken under one lock, in the order the controllers
+  performed the events.
+* It writes `linewatch.csv` at the end of the run, which `run-sniper` moves to `telemetry/`.
+
+**Per-line check** (`check_regress.py`, when both runs have `linewatch.csv`). For every line of both runs it
+replays the event history over the caches private to one core: L1-D, an L2 that is not shared, and a private
+L3. It requires:
+* **single writer:** a fill or refill in M or E only while no other core holds the line;
+* **no reader beside a writer:** a fill in S only while no other core holds the line in M or E;
+* **write run:** after core 1 obtains M, core 0's L1-D fills the line again (the step-4 read missed, so its copy
+  had been removed), and core 1's copy is downgraded or removed.
+
+The result line distinguishes `NOT MESI-CONSISTENT (per-line violation)` from `NOT MESI-CONSISTENT (aggregate
+totals below threshold; per-line check passed)`. Both still fail the script. `test_check_regress.py`
+checks the replay on synthetic histories:
+* four correct ones, including the two legal deviations below;
+* six with injected violations, for example a copy not invalidated, a stale step-4 hit, or an S fill beside M.
+
+**Why not exact per-line counts.** A first version required exactly one more coherence invalidation, refill and
+downgrade per line in the write run than in the read control. In the Stage 5 matrix it failed on lines whose
+histories are MESI-correct, for two reasons:
+1. **The first two reads reach the memory system in the other order.** In 16 of the 120 clean Gainestown
+   runs, for up to 25 lines, core 1's step-2 read was performed before core 0's step-1 read. Core 1 got E and
+   was downgraded by core 0, instead of the reverse, in LRU runs as well as RL runs.
+   * It always concerned the last lines (226–255) and never the dirty case, where step 1 hits.
+   * Most likely the barrier orders the threads' instructions, but not the completion of core 0's last,
+     still-outstanding DRAM misses. This explanation is not verified in the timing model.
+2. **Replacement evictions.** With `rl_lru` on silvermont's 24 KB L1-D, 144–160 of the 256 lines had an
+   eviction from a private cache during a run. 77–81 lines per clean write run had left core 0's L1-D before
+   core 1's write, so they needed no invalidation. Invalidated plus already-evicted lines always add up to 256.
+
+The invariant check accepts both and still rejects every injected violation.
+
+**Stage 5 results** ([`docs/rl/STAGE5_VALIDATION.md`](../../docs/rl/STAGE5_VALIDATION.md)):
+* **Per-line check:** passed in 144 of 144 pairs (24 configurations × 3 repetitions; five Gainestown
+  hierarchies and silvermont; LRU, `sf_lru`, `rl_lru`). In every Gainestown pair the write run refilled exactly
+  256 more regression lines.
+* **Aggregate rows:** failed in 8 pairs:
+  * 2 Gainestown pairs, where unrelated L1-D misses were 29–33 lower in the write run;
+  * 6 silvermont pairs with `rl_lru` on the L1-D, because of the evictions above.
+
+**Limitations.**
+* The watch sees the events the controllers report: fills, `updateCacheBlock` downgrades, `invalidateCacheBlock`
+  and evictions. An in-place S→M upgrade of a last-level private L2 (two-level hierarchy) has no event of its
+  own; there the L1-D's upgrade refill in M is what is checked.
+* A shared cache is not checked against the private ones; its inclusion is covered by `check_sharers.py`.
+* It assumes 64-byte lines. It checks states, not data; the program's data check covers the values.
 
 ### Coherence check (`SNIPER_COHERENCE_CHECK=1`)
 

@@ -19,6 +19,7 @@
 #include "metadata_info.h"
 #include "trace_thread.h"
 #include "line_tracer.h"
+#include "line_watch.h"
 #include "trace_manager.h"
 #include "mimicos.h"
 #include "performance_model.h"
@@ -65,6 +66,7 @@ namespace ParametricDramDirectoryMSI
 
 		std::cout << std::endl;
 		std::cout << "[Memory Manager] Initializing Memory Hierarchy for core " << core->getId() << std::endl;
+		LineWatch::init(); // test instrumentation (SNIPER_WATCH_VADDR), no-op otherwise
 		// Read Parameters from the Config file
 		std::map<MemComponent::component_t, CacheParameters> cache_parameters;
 		std::map<MemComponent::component_t, String> cache_names;
@@ -719,6 +721,8 @@ namespace ParametricDramDirectoryMSI
 			origin = Core::mem_origin_t::ACCEL_LLC;
 			entry = MemComponent::L1_DCACHE;
 		}
+		if (LineWatch::active() && !is_instruction)
+			LineWatch::noteAccess(address, physical_address); // before the access, so its own fills are counted
 		HitWhere::where_t result = m_cache_cntlrs[entry]->processMemOpFromCore(
 			eip,
 			lock_signal,

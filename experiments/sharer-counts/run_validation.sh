@@ -9,6 +9,8 @@
 #              MODES    sharetest modes (default "r w p u")
 #              L3_SIZES L3 sizes in KB (default "1024 512")
 #              FFT      0 to skip the FFT runs (default 1)
+#              EXTRA_ARGS  extra run-sniper arguments for every run, e.g. a replacement policy
+#                          ("-g perf_model/l2_cache/replacement_policy=rl_lru"); default none
 #
 # Suite (all 4-core Gainestown):
 #   FFT -p 4 -m 10 (default 8 MB L3; no L3 evictions)
@@ -24,13 +26,15 @@ JOBS=${JOBS:-4}
 MODES=${MODES:-r w p u}
 L3_SIZES=${L3_SIZES:-1024 512}
 FFT=${FFT:-1}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 make -s -C "$HERE" sharetest || exit 1
 cd "$ROOT" || exit 1
 
 run() { # NAME CMD...
    local name=$1; shift
-   ./run-sniper -n 4 -c gainestown -d "results/$PREFIX-$name" "$@" > "results/$PREFIX-$name.log" 2>&1
+   # shellcheck disable=SC2086
+   ./run-sniper -n 4 -c gainestown $EXTRA_ARGS -d "results/$PREFIX-$name" "$@" > "results/$PREFIX-$name.log" 2>&1
    echo "$name exit=$?"
 }
 

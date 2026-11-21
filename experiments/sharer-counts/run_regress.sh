@@ -10,6 +10,8 @@
 # with check_regress.py, and runs a 1-line traced copy of the "write" case
 # (SNIPER_TRACE_VADDR) whose [LINETRACE] output is in results/PREFIX-*-trace.log
 # (only builds that have the line tracer print it).
+# The write/read runs also count every event of the N regression lines (SNIPER_WATCH_VADDR /
+# SNIPER_WATCH_LINES, linewatch.csv), which check_regress.py uses for its per-line check.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -32,6 +34,7 @@ VADDR=$(nm "$HERE/coherence_regress" | awk '$3 == "regress_lines" {print "0x" $1
 
 for kind in clean dirty; do
    for step3 in write read; do
+      SNIPER_WATCH_VADDR=$VADDR SNIPER_WATCH_LINES=$N \
       ./run-sniper "${ARGS[@]}" -d "results/$PREFIX-$kind-$step3" -- "$HERE/coherence_regress" $kind $step3 "$N" \
          > "results/$PREFIX-$kind-$step3.log" 2>&1 &
    done

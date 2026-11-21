@@ -64,6 +64,12 @@ struct RlDiagnostics
    } misses;
    rlrepl::ClassCounts history_hit_other_write; // replaced_in_history_other_write by the history entry's features
 
+   // Features recorded into the history at each replacement eviction, by class (cross-checked against the LRU
+   // victim statistics lru-victim-* and hint-victim-heavy-*), and evictions whose block no longer had the features
+   // computed at its decision (expect 0: decision and eviction are one CacheSet::insert)
+   rlrepl::ClassCounts evicted;
+   UInt64 eviction_features_changed = 0;
+
    // Victims in M (audit I-3): M from a read fill and never written by this core while resident
    UInt64 victims_m = 0;
    UInt64 victims_m_unwritten = 0;

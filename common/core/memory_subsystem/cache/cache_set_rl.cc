@@ -240,6 +240,8 @@ CacheSetInfoRL::registerDiagnosticStats(String name, core_id_t core_id)
    reg("miss-replaced-not-in-history-other-write", &d.misses.replaced_not_in_history_other_write);
    reg("miss-inconsistent", &d.misses.inconsistent);
    regClasses("history-hit-other-write", d.history_hit_other_write);
+   regClasses("evicted", d.evicted);
+   reg("eviction-features-changed", &d.eviction_features_changed);
    reg("victims-M", &d.victims_m);
    reg("victims-M-unwritten", &d.victims_m_unwritten);
 }
@@ -581,6 +583,9 @@ CacheSetRL::onEviction(UInt32 way, const CacheBlockInfo *victim)
    if (m_pending.valid && m_pending.way == way)
    {
       f = m_pending.features;
+      if (RlDiagnostics *diag = m_info->diag())
+         if (!(f == featuresOf(way)))
+            ++diag->eviction_features_changed;
    }
    else
    {
@@ -592,6 +597,7 @@ CacheSetRL::onEviction(UInt32 way, const CacheBlockInfo *victim)
    if (RlDiagnostics *diag = m_info->diag())
    {
       diag->departed[victim->getTag()] = {RlDiagnostics::REPLACED, RlWriteOracle::now()};
+      diag->evicted.add(f);
       if (m_info->algorithm() == CacheSetInfoRL::PAPER)
          diag->paper->before_eviction(m_info->paper(), m_set, victim->getTag());
       else

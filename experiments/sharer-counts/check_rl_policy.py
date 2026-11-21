@@ -9,12 +9,20 @@ Checks, every cache and core with an RL policy (docs/rl/POLICY_CORES.md):
   * the adapter's unexpected-event counters are 0: no-eligible-victim, eviction-without-decision, inv-unclassified,
     candidate-state-unknown, history-refill-removals, and for rl_lru upgrade-refills-unmatched and
     upgrade-stash-overwritten;
-  * history-inserts == rl-event-eviction when the policy learns and the run has SNIPER_RL_EVENT_CHECK=1 stats;
+  * history-inserts == rl-event-eviction when the policy learns and the run has SNIPER_RL_EVENT_CHECK=1 stats
+    (every replacement eviction is recorded exactly once; invalidations never are);
+  * history accounting: |history-inserts - aged out - returned| <= history capacity (2 x the cache's lines);
+  * rl_lru: upgrade-carryovers == inv-upgrade (== rl-event-fill-upgrade-refill): every own upgrade carries its
+    metadata over, and an upgrade refill is never a miss (no false -1);
   * with rl_diag/enabled = true, the diagnostics close against the cores' own counters: rewards (rl) or history
     hits / aged-out entries (sf) by feature class sum to the core totals, decisions agree, the victim positions sum
     to the decisions, the miss classes sum to the misses and equal rl-event-fill-demand, history hits equal the
     misses classified as "replaced, in history", M victims equal lru-victim-M, and miss-inconsistent and
-    double-dropped are 0.
+    double-dropped are 0;
+  * with diagnostics, the features recorded into the history match the evicted blocks, counted independently by
+    the LRU victim statistics: evicted-S/E/M == lru-victim-S/E/M, evicted-AT == the victims whose DELIVERED hint
+    is heavy (hint-victim-heavy-both + -delivered-only; the oracle-heavy count differs whenever the hint is
+    stale), and eviction-features-changed == 0.
 Only counters that change together are compared, so the checks also hold for region-of-interest deltas.
 
 The summary also reads the weight snapshots (rl-snapshots-<cache>-<core>.csv; run-sniper moves them to telemetry/).
@@ -47,6 +55,35 @@ def load(run):
     return stats
 
 
+def config(run):
+    cfg, section = {}, None
+    p = os.path.join(sim_dir(run), 'sim.cfg')
+    if os.path.exists(p):
+        for line in open(p):
+            line = line.strip()
+            if line.startswith('['):
+                section = line[1:-1]
+            elif '=' in line and section:
+                k, v = line.split('=', 1)
+                cfg[section + '/' + k.strip()] = v.split('#')[0].strip().strip('"')
+    return cfg
+
+
+SECTIONS = {'L1-D': 'l1_dcache', 'L1-I': 'l1_icache', 'L2': 'l2_cache', 'L3': 'l3_cache'}
+
+
+def history_capacity(cfg, comp):
+    """2 x (lines of the cache + one set of slack for the L2 metadata set), or None if unknown"""
+    sec = 'perf_model/' + SECTIONS.get(comp, '')
+    try:
+        size = int(cfg[sec + '/cache_size'].split(',')[0])
+        assoc = int(cfg[sec + '/associativity'].split(',')[0])
+        block = int(cfg.get(sec + '/cache_block_size', cfg.get('perf_model/l1_dcache/cache_block_size', '64')).split(',')[0])
+    except (KeyError, ValueError):
+        return None
+    return 2 * (size * 1024 // block + assoc)
+
+
 def policies(s):
     """(component, prefix) for every cache with an RL policy"""
     out = []
@@ -59,6 +96,7 @@ def policies(s):
 
 def check(run, s):
     problems = []
+    cfg = config(run)
     found = policies(s)
     if not found:
         problems.append('no sf_lru / rl_lru statistics')
@@ -77,6 +115,16 @@ def check(run, s):
             learns = g(f'{p}-history-inserts') > 0
             if has('rl-event-eviction') and learns and g(f'{p}-history-inserts') != g('rl-event-eviction'):
                 problems.append(f'{where}: history-inserts {g(p + "-history-inserts")} != evictions {g("rl-event-eviction")}')
+            cap = history_capacity(cfg, comp)
+            removed = g('rl-reward-evict-good') + g('rl-reward-evict-bad') if p == 'rl' else g('sf-history-aged-out') + g('sf-reward-negative')
+            occupancy = g(f'{p}-history-inserts') - removed
+            if cap is not None and abs(occupancy) > cap:
+                problems.append(f'{where}: history occupancy change {occupancy} exceeds capacity {cap}')
+            if p == 'rl':
+                if g('rl-upgrade-carryovers') != g('rl-inv-upgrade'):
+                    problems.append(f'{where}: upgrade-carryovers {g("rl-upgrade-carryovers")} != inv-upgrade {g("rl-inv-upgrade")}')
+                if has('rl-event-fill-upgrade-refill') and g('rl-event-fill-upgrade-refill') != g('rl-inv-upgrade'):
+                    problems.append(f'{where}: upgrade refills {g("rl-event-fill-upgrade-refill")} != inv-upgrade {g("rl-inv-upgrade")}')
 
             d = lambda n: g(f'{p}-diag-{n}')
             if not has(f'{p}-diag-misses'):
@@ -104,6 +152,14 @@ def check(run, s):
             eq.append(('history-hit-other-write by sharing', d('history-hit-other-write-BT') + d('history-hit-other-write-AT'),
                        d('miss-replaced-in-history-other-write')))
             eq.append(('M victims', d('victims-M'), g('lru-victim-M')))
+            for c in 'SEM':
+                eq.append((f'evicted-{c} vs lru-victim-{c}', d(f'evicted-{c}'), g(f'lru-victim-{c}')))
+            evictions = sum(g(f'lru-victim-{c}') for c in ('S', 'E', 'M', 'other'))
+            eq.append(('evicted by sharing vs victims', d('evicted-BT') + d('evicted-AT'), evictions))
+            if has('hint-victim-heavy-both'):
+                eq.append(('evicted-AT vs delivered-heavy victims', d('evicted-AT'),
+                           g('hint-victim-heavy-both') + g('hint-victim-heavy-delivered-only')))
+            eq.append(('eviction-features-changed', d('eviction-features-changed'), 0))
             eq.append(('miss-inconsistent', d('miss-inconsistent'), 0))
             for name, a, b in eq:
                 if a != b:
@@ -159,6 +215,11 @@ def summary(run, s):
             print(f'     I-2 history hits where another core wrote the line after the eviction: {d("miss-replaced-in-history-other-write")} '
                   f'of {hits} ({pct(d("miss-replaced-in-history-other-write"), hits)}); by class: '
                   + ' '.join(f'{c}:{d("history-hit-other-write-" + c)}' for c in CLASSES))
+            if f'{comp}.hint-victim-heavy-both' in s:
+                delivered = g('hint-victim-heavy-both') + g('hint-victim-heavy-delivered-only')
+                oracle = g('hint-victim-heavy-both') + g('hint-victim-heavy-oracle-only')
+                print(f'     features: AT recorded for {d("evicted-AT")} evictions = delivered-heavy victims {delivered} '
+                      f'(the oracle would say {oracle})')
             print(f'     I-3 M victims never written by this core while resident: {d("victims-M-unwritten")} of {d("victims-M")} '
                   f'({pct(d("victims-M-unwritten"), d("victims-M"))})')
             snapshots(run, comp, core, p)
