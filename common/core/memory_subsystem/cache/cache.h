@@ -104,6 +104,8 @@ private:
 		UInt64 demand_fills_of_upgrading = 0; // DEMAND_FILL of a line with a pending INV_UPGRADE (expect 0)
 		UInt64 upgrade_overlaps = 0;          // INV_UPGRADE while another line of the set awaits its refill
 		UInt64 victims_upgrading = 0;         // victim in SHARED_UPGRADING (expect 0)
+		UInt64 insert_hash = 14695981039346656037ULL; // FNV-1a over (set, tag, evicted?, evicted tag) of every insert, in
+		                                              // order: equal hashes = identical fill/victim sequences
 		std::vector<std::vector<IntPtr>> pending_upgrades; // per set: lines dropped with INV_UPGRADE, not yet refilled
 		Lock lock;
 	};

@@ -114,7 +114,9 @@ Cache::Cache(
 	reuse_levels[1] = 10;
 	reuse_levels[2] = 20;
 
-	m_set_info = CacheSet::createCacheSetInfo(name, cfgname, core_id, replacement_policy, m_associativity);
+	// The RL policies size their per-set state up front: the regular sets plus the L2 metadata fake set, if any
+	m_set_info = CacheSet::createCacheSetInfo(name, cfgname, core_id, replacement_policy, m_associativity,
+		m_num_sets + ((name == "L2" && metadata_passthrough_loc > 2) ? 1 : 0));
 	m_sets = new CacheSet *[m_num_sets];
 	m_fake_sets = nullptr; // Only allocate for L2 with metadata passthrough
 	
@@ -157,6 +159,7 @@ Cache::Cache(
 		registerStatsMetric(name, core_id, "rl-event-demand-fill-of-upgrading", &m_rl_event_check->demand_fills_of_upgrading);
 		registerStatsMetric(name, core_id, "rl-event-upgrade-overlap", &m_rl_event_check->upgrade_overlaps);
 		registerStatsMetric(name, core_id, "rl-event-victim-upgrading", &m_rl_event_check->victims_upgrading);
+		registerStatsMetric(name, core_id, "rl-event-insert-hash", &m_rl_event_check->insert_hash);
 	}
 
 	for (int i = 0; i < 5; i++)
@@ -898,6 +901,10 @@ void Cache::rlCheckInsert(UInt32 set_index, IntPtr tag, CacheSetEvent::fill_t fi
 	ScopedLock sl(m_rl_event_check->lock);
 	RlEventCheck &c = *m_rl_event_check;
 	++c.fills[fill];
+	const UInt64 words[4] = { set_index, (UInt64)tag, eviction ? 1ULL : 0ULL, eviction ? (UInt64)victim->getTag() : 0ULL };
+	for (UInt64 word : words)
+		for (int byte = 0; byte < 8; ++byte)
+			c.insert_hash = (c.insert_hash ^ ((word >> (8 * byte)) & 0xff)) * 1099511628211ULL;
 	if (eviction)
 	{
 		++c.evictions;

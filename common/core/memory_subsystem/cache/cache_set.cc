@@ -9,6 +9,7 @@
 #include "cache_set_srrip.h"
 #include "cache_set_mplru.h"
 #include "cache_set_chirp.h"
+#include "cache_set_rl.h"
 #include "cache_base.h"
 #include "log.h"
 #include "simulator.h"
@@ -233,6 +234,10 @@ CacheSet::createCacheSet(String cfgname, core_id_t core_id,
       case CacheBase::CHIRP:
          return new CacheSetCHiRP(cache_type, associativity, blocksize, dynamic_cast<CacheSetInfoCHiRP*>(set_info), is_tlb_set);
 
+      case CacheBase::SF_LRU:
+      case CacheBase::RL_LRU:
+         return new CacheSetRL(cache_type, associativity, blocksize, dynamic_cast<CacheSetInfoRL*>(set_info), is_tlb_set);
+
       default:
          LOG_PRINT_ERROR("Unrecognized Cache Replacement Policy: %i",
                policy);
@@ -243,7 +248,7 @@ CacheSet::createCacheSet(String cfgname, core_id_t core_id,
 }
 
 CacheSetInfo*
-CacheSet::createCacheSetInfo(String name, String cfgname, core_id_t core_id, String replacement_policy, UInt32 associativity)
+CacheSet::createCacheSetInfo(String name, String cfgname, core_id_t core_id, String replacement_policy, UInt32 associativity, UInt32 num_sets)
 {
    CacheBase::ReplacementPolicy policy = parsePolicyType(replacement_policy);
    switch(policy)
@@ -263,6 +268,10 @@ CacheSet::createCacheSetInfo(String name, String cfgname, core_id_t core_id, Str
             ? Sim()->getCfg()->getInt(cfgname + "/chirp/threshold") : 2;
          return new CacheSetInfoCHiRP(name, cfgname, core_id, associativity, table_size, threshold);
       }
+      case CacheBase::SF_LRU:
+         return new CacheSetInfoRL(name, cfgname, core_id, associativity, num_sets, CacheSetInfoRL::PAPER);
+      case CacheBase::RL_LRU:
+         return new CacheSetInfoRL(name, cfgname, core_id, associativity, num_sets, CacheSetInfoRL::REWARD);
       default:
          return NULL;
    }
@@ -308,6 +317,10 @@ CacheSet::parsePolicyType(String policy)
       return CacheBase::MPLRU;
    if (policy == "chirp")
       return CacheBase::CHIRP;
+   if (policy == "sf_lru")
+      return CacheBase::SF_LRU;
+   if (policy == "rl_lru")
+      return CacheBase::RL_LRU;
 
    LOG_PRINT_ERROR("Unknown replacement policy %s", policy.c_str());
 }

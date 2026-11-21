@@ -1,9 +1,10 @@
 # RL replacement cores
 
 Stage 1 of the Sniper port: the two replacement algorithms as simulator-independent, header-only C++ cores with
-deterministic unit tests. Stage 2: Sniper reports classified cache events to its cache sets through no-op hooks
-(see [Sniper integration](#sniper-integration)). **No RL policy is registered yet** (Stage 3); `CacheSetLRU`, the MESI
-protocol and the sharer-hint code are unchanged. The audit that motivates every decision here is
+deterministic unit tests. Stage 2: Sniper reports classified cache events to its cache sets through no-op hooks.
+Stage 3: both cores are selectable Sniper replacement policies, `sf_lru` and `rl_lru` (see
+[Sniper integration](#sniper-integration)). `CacheSetLRU`, `CacheSetSRRIP`, the MESI protocol and the sharer-hint code
+are unchanged. The audit that motivates every decision here is
 [`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) (issue numbers I-n refer to it).
 
 | Algorithm | Core | Reference implementation (ChampSim, `mesi-implementation` `148b9c3`) |
@@ -274,8 +275,8 @@ events happen in Sniper's order.
 
 **Stage 2 (implemented): event hooks.** Sniper reports every cache event a learning policy needs to its `CacheSet`, with
 the controller's classification. All hooks are no-ops in the base class, so every existing policy, including
-`CacheSetLRU`, behaves exactly as before. **Stage 3 (not started)** adds the `CacheSetRL` adapter that implements the
-hooks with the cores and registers the policy names.
+`CacheSetLRU`, behaves exactly as before. **Stage 3 (implemented)** adds the `CacheSetRL` adapter, which implements the
+hooks with the cores, and registers the policy names `sf_lru` and `rl_lru` (see [Policies](#policies-sf_lru-and-rl_lru)).
 
 ### Hooks (`cache/cache_set.h`, `cache/cache_set_events.h`)
 
@@ -330,32 +331,101 @@ in place (`SHARED_UPGRADING`), never invalidate-and-refill. The line tracer prin
 level && count)` (`:1162`); in an L2, `retrieveCacheBlock(..., first_hit && count)` (`:1820`). Fills and write-backs pass
 `update_replacement = false`. A learning policy therefore sees exactly the hits LRU sees.
 
-### Stage 3 adapter mapping
+### Policies `sf_lru` and `rl_lru`
 
-| Hook | Core call |
+Selected like any Sniper policy, per cache; the private L2 is the target (`cache/cache_set_rl.{h,cc}`):
+
+```
+# Souza & Freitas reproduction on the L2
+-g perf_model/l2_cache/replacement_policy=sf_lru
+-g perf_model/l2_cache/sf/mode=both          # off | state | bitset | both            (default both)
+-g perf_model/l2_cache/sf/rule=text          # text | example                         (default text)
+-g perf_model/l2_cache/sf/combine=and        # and | or (RL-Both only)                (default and)
+
+# Our modified reward-learning algorithm on the L2
+-g perf_model/l2_cache/replacement_policy=rl_lru
+-g perf_model/l2_cache/rl/mode=both          # off | state | bitset | both            (default both)
+-g perf_model/l2_cache/rl/window=4           # N >= 1                                 (default 4)
+-g perf_model/l2_cache/rl/alpha=0.1          # [0, 1]                                 (default 0.1)
+-g perf_model/l2_cache/rl/protect_feedback=true                                       (default true)
+-g perf_model/l2_cache/rl/weight_scope=global  # global | per_set                     (default global)
+```
+
+Unset keys take the defaults above, the approved Stage 1 settings. An unrecognized value stops the simulation with a
+configuration error. Each cache prints its effective configuration at start-up, for example
+`[RL] L2 core 0: rl_lru mode=both window=4 alpha=0.1 protect_feedback=1 weight_scope=global history=16/set threshold=>2 of 4 cores`.
+Keys given with `-g` or in a `.cfg` file are also recorded in `sim.cfg`. Experiments should set them explicitly.
+
+**Architecture.**
+
+* **`CacheSetInfoRL`** (one per cache) extends `CacheSetInfoLRU`, so every LRU statistic is still produced
+  (`access-mru-*`, `lru-victim-*`, `oracle-*`, `cachedlocs-*`, `hint-*`). It also:
+  * owns the one learning core, constructed with the cache's set count: global weights, plus per-set histories and
+    per-line metadata inside the core;
+  * owns a lock that serializes every core call, because other cores' threads deliver coherence invalidations to a
+    private L2;
+  * reads the configuration and registers the policy statistics.
+
+  `Cache` passes its set count to `CacheSet::createCacheSetInfo`, plus one for the L2 metadata fake set when that
+  exists. The auxiliary tag directory (`cache_atd.cc`) does not pass a count, so the RL policies refuse to run there.
+* **`CacheSetRL`** (one per set) takes its set index from `CacheSetInfoRL::registerSet()` and keeps a `LruOrder` (the
+  same ranks as `CacheSetLRU`). Its calls into the core:
+
+| Sniper | Core call |
 |---|---|
 | `onMiss(tag)` | `on_miss(set, tag)` |
-| `getReplacementIndex` with an invalid way | lowest invalid way, `LruOrder::touch` |
-| `getReplacementIndex`, set full | `candidates = LruOrder::candidates(K, isValidReplacement)`, `d = choose(...)`, `commit`, `touch(d.victim)` |
-| `onEviction(way, victim)` | `on_eviction(set, victim->getTag(), d.victim_features)` |
-| `onFill(way, tag, fill)` | `on_fill(set, way, tag, demand / upgrade_refill)` |
-| `updateReplacementIndex(way)` | `touch(way)`, `RewardPolicy::on_hit` |
-| `onInvalidate(way, tag, reason)` | `RewardPolicy::on_invalidate` with `coherence`, `back_invalidation` or `upgrade` |
+| `getReplacementIndex`, invalid way present | lowest invalid way, moved to MRU (as `CacheSetLRU`); no decision |
+| `getReplacementIndex`, set full | `candidates = LruOrder::candidates(K, isValidReplacement)`, `choose`, `commit`; the decision's victim features are kept for `onEviction`; `recordVictimState` / `recordVictimSharers` as LRU; victim moved to MRU |
+| `onEviction(way, victim)` | `on_eviction(set, victim->getTag(), saved features)` (skipped in mode off) |
+| `onFill(way, tag, fill)` | `on_fill` (demand / upgrade_refill) |
+| `updateReplacementIndex(way)` | `access-mru` histogram, move to MRU, `RewardPolicy::on_hit` |
+| `onInvalidate(way, tag, reason)` | `RewardPolicy::on_invalidate` (coherence, back_invalidation, upgrade); `INV_UNCLASSIFIED` counted and treated as coherence. The paper core keeps no per-line state. |
 
-`info(way)` = `make_features(map(block->getCState()), block->getSharerHint(), num application cores)`: the block's own
-state and its delivered hint, never the oracle. `queryOracleSharers` stays a diagnostic (`lru-victim`/`hint-victim`
-statistics) and may only be used in an explicitly labeled comparison mode.
+**Features.** `make_features(state, block->getSharerHint(), application cores)`:
 
-Things the adapter must get right (audit I-3, I-21):
+* the block's own state: M/O → M, E → E, S and SHARED_UPGRADING → S (`SHARED_UPGRADING` is never a candidate);
+* its delivered hint, never the oracle.
 
-* Sniper's actual state is used, including M granted on a read: no M→E reinterpretation. A Stage 4 statistic will count
-  read-granted M victims.
-* Coherence and back invalidations never create history entries or rewards.
-* An upgrade carries the block's metadata over and is not an eviction.
-* `SHARED_UPGRADING` ways are never candidates (`isValidReplacement`).
-* `INV_UNCLASSIFIED` should not occur in an L1/L2; the adapter treats it like a coherence invalidation (no feedback).
-* `CacheSetInfoRL` should extend `CacheSetInfoLRU` so `lru-victim-*`, `oracle-*` and `hint-*` statistics (and
-  `experiments/sharer-counts/check_sharers.py`) keep working, and every parameter is printed.
+M granted on a read stays M. A block without a hint (0, e.g. in an L1) is below the threshold.
+
+**Statistics.** All are per cache and core, prefixed `rl-` (`rl_lru`) or `sf-` (`sf_lru`). Weights are signed parts per
+million. Like every Sniper statistic, `sim.stats` reports them as the change over the region of interest. Weights and
+`max-passes` are levels, so read them from runs without a separate warm-up region, or as differences.
+
+| `rl-` | Meaning |
+|---|---|
+| `decisions`, `chose-oldest`, `chose-other` | Decisions with at least two candidates; victim was / was not the LRU way |
+| `reward-evict-bad`, `-evict-good`, `-protect-good`, `-protect-wasted` | The four rewards |
+| `passes`, `max-passes` | Passed-over events; most passes of one block (repeated protection, I-1) |
+| `inv-coherence`, `inv-back-invalidation`, `inv-upgrade` | Invalidations seen by the core |
+| `upgrade-carryovers`, `upgrade-refills-unmatched`, `upgrade-stash-overwritten` | Upgrade metadata carry-over (the last two expect 0) |
+| `weight-{S,E,M,BT,AT}-ppm` | Learned weights (per-set scope: mean over sets) |
+
+| `sf-` | Meaning |
+|---|---|
+| `decisions`, `first-accepted`, `second-chances`, `empty-history-decisions`, `weighted-decisions` | Next-attempt decisions |
+| `reward-negative`, `reward-positive` | The paper's rewards, counted at misses |
+| `history-aged-out` | History entries dropped for space |
+| `avg-weight-{M,E,S,AT,BT}-ppm` | Mean ratio weights at decisions |
+
+Both policies also report adapter counters:
+
+* `history-inserts`: equals the evictions in mode ≠ off.
+* `full-set-decisions`.
+* `history-refill-removals`: an entry found at a fill.
+* `eviction-without-decision`, `no-eligible-victim`, `inv-unclassified`, `candidate-state-unknown`.
+
+Every counter in the last two bullets expects 0.
+
+**Verified behavior** (Stage 3 validation, single-core trace replay and 2/4-core runs):
+
+* `sf_lru` with `sf/mode=off`, and `rl_lru` with `rl/mode=off`, `rl/window=1` or `rl/alpha=0`, give exactly LRU's
+  victim sequence (equal `rl-event-insert-hash`). All other statistics are identical too, with an 8 MB and a 512 KB L3.
+* The learning configurations change the victim sequence. `text` and `example`, and `and` and `or`, each give a
+  different one. Repeated runs are identical: the cores use no random numbers.
+* History accounting closes: inserts − aged out − returned ≤ capacity (2 × K per set).
+* Upgrade carry-overs equal the upgrade refills. All error counters are 0.
+* `coherence_regress` with either policy on the L2 is MESI-consistent and correctly classified, with 0 stale write hits.
 
 ### Event checker
 
@@ -365,6 +435,8 @@ checks a run:
 
 * An upgrade refill always matches a pending own upgrade of that line, and no demand fill hits a pending one.
 * No victim is `SHARED_UPGRADING`, no invalidation is unclassified, and no two upgrades in a set overlap.
+* `rl-event-insert-hash` is an order-sensitive hash of every insert (set, tag, evicted tag). Equal hashes mean identical
+  victim sequences.
 * Upgrade invalidations equal upgrade refills.
 * Back invalidations equal the controller's `backinval-*` counters, and coherence invalidations fall within its
   `coherency-*` counters.
@@ -398,6 +470,18 @@ coherence.
 
   The private L2 target is not affected. For an L1 adapter, such a block simply disappears; the next `onFill` of its way
   resets the metadata, so the only cost is a protection outcome that is never rewarded.
+
+* **Stage 3 observations** (functional runs, not evaluations):
+  * **Single core.** With one core the threshold is "> 0 of 1", so every block with a hint is above it and the sharing
+    feature is constant. `sf_lru` with `example` + `and` then never accepts candidate #1, because the class check always
+    says keep. That is the AND/OR ambiguity (I-9), not a bug; `or` behaves differently.
+  * **Weight saturation.** In `sharetest` the global weights of `rl_lru` saturate near −1 within a short run, because
+    most evicted blocks return quickly. With all weights equal the policy falls back to LRU order (I-4).
+  * **Repeated protection.** `rl-max-passes` reached 26 in `sharetest u`, the repeated protection of audit I-1.
+* **Auxiliary tag directory.** `cache_atd.cc` builds its sets without a `Cache`, so it cannot size an RL core. The RL
+  policies stop with a configuration error there.
+* **The SRRIP baseline needs `srrip/bits`** (and `srrip/tlb_enabled`), which `gainestown.cfg` does not define. This is
+  pre-existing and unrelated to the RL policies.
 
 ### Overlapping upgrades
 

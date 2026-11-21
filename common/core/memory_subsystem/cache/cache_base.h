@@ -62,6 +62,8 @@ class CacheBase
          RANDOM,
          MPLRU,       // Metadata-Priority LRU for NUCA
          CHIRP,       // Dead-entry predictor (CHiRP) for TLB replacement
+         SF_LRU,      // Souza & Freitas RL replacement on LRU (cache_set_rl.h)
+         RL_LRU,      // modified reward-learning RL replacement on LRU (cache_set_rl.h)
          NUM_REPLACEMENT_POLICIES
       };
 
