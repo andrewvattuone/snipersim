@@ -180,8 +180,9 @@ The aggregate thresholds were not changed. Details:
     could widen the window. This is not confirmed: gdb is not installed and core dumps are disabled here.
 * **Start-up crash.** It happened once. In an LRU run without the line watch, the Stage 5 binary executes the
   same code as the baseline; the crash did not recur in 72 later LRU runs.
-* **Status:** open. It does not affect any simulated result, but a crashed run loses its `sim.stats` export
-  (recoverable with `tools/dumpstats.py -d RUN`).
+* **Status:** both crashes were pre-existing races in Sniper's trace front end, now fixed by commit `fa8d21b6`.
+  The investigation, final implementation and tests are in [`CRASH_INVESTIGATION.md`](CRASH_INVESTIGATION.md). The
+  Stage 5 results above were produced before that fix; the crashed runs are reported as crashed.
 
 ## Known limitations and untested configurations
 
