@@ -131,6 +131,17 @@ class AppReaderPool
          return m_entries.size();
       }
 
+      /* Forget every entry and the liveness state, between application runs
+         (TraceManager::cleanup()): the readers belong to the run's
+         TraceThreads, which cleanup() deletes. */
+      void reset() {
+         std::lock_guard<std::mutex> lk(m_lock);
+         m_entries.clear();
+         m_live_count = 0;
+         m_ever_live = false;
+         m_terminated = false;
+      }
+
       /* Stop every registered front end, for teardown. */
       void stopAll() {
          std::lock_guard<std::mutex> lk(m_lock);
@@ -156,8 +167,12 @@ class TraceManager
             void run();
             _Thread *m_thread;
             TraceManager *m_manager;
+            /* The application run this monitor serves, fixed before its thread
+               is created (TraceManager::start()), so a thread that starts late
+               still watches its own run only. */
+            const UInt64 m_generation;
          public:
-            Monitor(TraceManager *manager);
+            Monitor(TraceManager *manager, UInt64 generation);
             ~Monitor();
             void spawn();
       };
@@ -174,7 +189,10 @@ class TraceManager
          UInt32 num_runs;           //< Number of completed runs
       };
 
-      Monitor *m_monitor;
+      /* One monitor per application run, created and spawned by start() (main
+         thread only).  Never deleted: a monitor thread is never joined, and the
+         one of an earlier run may still be about to return. */
+      std::vector<Monitor *> m_monitors;
       /* Every trace thread, in creation order.  Read and written only while
          holding m_threads_lock, a leaf lock: nothing else is acquired while
          it is held, so it may be taken with m_lock (or any other lock) held.
@@ -196,6 +214,10 @@ class TraceManager
          leaf lock as well. */
       std::mutex m_watch_lock;
       bool m_watch_closed = false;   // closeWatch() or cleanup() ran: the monitor stops
+      /* The current application run, incremented by start() under
+         m_watch_lock; a monitor whose own generation differs returns instead
+         of watching another run. */
+      UInt64 m_watch_generation = 0;
       const unsigned m_hang_seconds; // traceinput/hang_report, read once at construction
       volatile bool m_app_crashed = false;
       void reportHang(unsigned seconds);
@@ -228,7 +250,9 @@ class TraceManager
       /* Set once stop() has been entered.  stop() is reachable from more
          than one place -- the end of a run, and a magic handler deciding the
          last application has finished -- and running it twice writes to
-         response pipes that the first pass already closed. */
+         response pipes that the first pass already closed.  Per application
+         run: cleanup() clears both flags before the next run
+         (traceinput/num_runs), once no thread of the last run is left. */
       std::atomic<bool> m_shutdown_requested{false};
       /* stop()'s own once-guard, separate from m_shutdown_requested so that
          a shutdown *request* does not make a later forced stop() return

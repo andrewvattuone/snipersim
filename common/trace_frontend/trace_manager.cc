@@ -76,7 +76,7 @@ static void dumpAllStacks()
 // #define DEBUG
 
 TraceManager::TraceManager()
-   : m_monitor(new Monitor(this)), m_threads(0), m_hang_seconds(Sim()->getCfg()->getInt("traceinput/hang_report")), m_num_threads_started(0), m_num_threads_running(0), m_done(0), m_stop_with_first_app(Sim()->getCfg()->getBool("traceinput/stop_with_first_app")), m_app_restart(Sim()->getCfg()->getBool("traceinput/restart_apps")), m_emulate_syscalls(Sim()->getCfg()->getBool("traceinput/emulate_syscalls")), m_num_apps(Sim()->getCfg()->getInt("traceinput/num_apps")), m_num_apps_nonfinish(m_num_apps), m_app_info(m_num_apps), m_tracefiles(m_num_apps), m_responsefiles(m_num_apps)
+   : m_threads(0), m_hang_seconds(Sim()->getCfg()->getInt("traceinput/hang_report")), m_num_threads_started(0), m_num_threads_running(0), m_done(0), m_stop_with_first_app(Sim()->getCfg()->getBool("traceinput/stop_with_first_app")), m_app_restart(Sim()->getCfg()->getBool("traceinput/restart_apps")), m_emulate_syscalls(Sim()->getCfg()->getBool("traceinput/emulate_syscalls")), m_num_apps(Sim()->getCfg()->getInt("traceinput/num_apps")), m_num_apps_nonfinish(m_num_apps), m_app_info(m_num_apps), m_tracefiles(m_num_apps), m_responsefiles(m_num_apps)
 {
    setupTraceFiles(0);
 }
@@ -529,6 +529,14 @@ void TraceManager::cleanup()
       std::lock_guard<std::mutex> tl(m_threads_lock);
       threads.swap(m_threads);
    }
+   /* Only finished threads may be deleted, and only then is it safe to reset
+      the per-run shutdown state below: every caller of stop() and
+      requestShutdown() runs on a trace thread, and m_finished is the last
+      thing a trace thread writes. */
+   for (std::vector<TraceThread *>::iterator it = threads.begin(); it != threads.end(); ++it)
+     LOG_ASSERT_ERROR(!(*it)->started() || (*it)->m_finished,
+                      "Trace thread %d of the last application run is still running: the next run (traceinput/num_runs) cannot start",
+                      (*it)->getThread()->getId());
    for (std::vector<TraceThread *>::iterator it = threads.begin(); it != threads.end(); ++it)
      delete *it;
 
@@ -536,6 +544,15 @@ void TraceManager::cleanup()
    m_app_info.clear();
    m_app_info.resize(m_num_apps);
    m_num_apps_nonfinish = m_num_apps;
+
+   /* Per-run state of the next application run (traceinput/num_runs). Without
+      this, the second run's stop() returned at once (m_stop_entered), so its
+      wait() never ended, and isDone() was true from its start. */
+   m_app_reader_pool.reset();             // its readers were the deleted threads'
+   m_injected_live_count.store(0);
+   m_num_threads_started.store(0);
+   m_shutdown_requested.store(false, std::memory_order_release);
+   m_stop_entered.store(false, std::memory_order_release);
 }
 
 void TraceManager::cleanupAllThreads()
@@ -560,11 +577,15 @@ void TraceManager::start()
       statistics (test/sniper-in-sniper). */
    SimRoiStart();
 
+   Monitor *monitor;
    {
       std::lock_guard<std::mutex> wl(m_watch_lock);
       m_watch_closed = false;      // a later run (traceinput/num_runs) watches its new threads
+      // ... with its own monitor, whose generation is fixed here, before its thread exists
+      monitor = new Monitor(this, ++m_watch_generation);
    }
-   m_monitor->spawn();
+   m_monitors.push_back(monitor);
+   monitor->spawn();
    // A copy: a thread spawned here can create another one (newThread) at once
    const std::vector<TraceThread *> threads = threadsSnapshot();
    for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
@@ -739,8 +760,9 @@ void TraceManager::accessMemory(int core_id, Core::lock_signal_t lock_signal, Co
    LOG_PRINT_ERROR("Unable to find core %d", core_id);
 }
 
-TraceManager::Monitor::Monitor(TraceManager *manager)
+TraceManager::Monitor::Monitor(TraceManager *manager, UInt64 generation)
    : m_manager(manager)
+   , m_generation(generation)
 {
 }
 
@@ -807,7 +829,7 @@ void TraceManager::Monitor::run()
        std::lock_guard<std::mutex> wl(m_manager->m_watch_lock);
        /* First, under the lock: after closeWatch() the Simulator, its cores and
           its thread manager may be gone, and nothing below may run */
-       if (m_manager->m_watch_closed)
+       if (m_manager->m_watch_closed || m_manager->m_watch_generation != m_generation)
          return;
        sig = Sim()->getClockSkewMinimizationServer()
              ? Sim()->getClockSkewMinimizationServer()->getGlobalTime().getFS() : 0;
