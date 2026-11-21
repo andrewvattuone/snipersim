@@ -161,6 +161,13 @@ dl::Decoder * Simulator::getDecoder()
 
 void Simulator::release()
 {
+   /* The trace monitor thread is never joined and may outlive the simulator.
+      From here on it must not touch it: closing the watch is the boundary it
+      synchronizes on (TraceManager::closeWatch(), TraceManager::Monitor::run()).
+      Every caller of release() passes through here, after the run (standalone)
+      or in the middle of it (a Python script's abort, py_hooks.cc). */
+   if (m_singleton->m_trace_manager)
+      m_singleton->m_trace_manager->closeWatch();
    m_singleton->m_running = false;
    // Fxsupport::fini();
    delete m_singleton;

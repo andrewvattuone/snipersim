@@ -76,7 +76,7 @@ static void dumpAllStacks()
 // #define DEBUG
 
 TraceManager::TraceManager()
-   : m_monitor(new Monitor(this)), m_threads(0), m_num_threads_started(0), m_num_threads_running(0), m_done(0), m_stop_with_first_app(Sim()->getCfg()->getBool("traceinput/stop_with_first_app")), m_app_restart(Sim()->getCfg()->getBool("traceinput/restart_apps")), m_emulate_syscalls(Sim()->getCfg()->getBool("traceinput/emulate_syscalls")), m_num_apps(Sim()->getCfg()->getInt("traceinput/num_apps")), m_num_apps_nonfinish(m_num_apps), m_app_info(m_num_apps), m_tracefiles(m_num_apps), m_responsefiles(m_num_apps)
+   : m_monitor(new Monitor(this)), m_threads(0), m_hang_seconds(Sim()->getCfg()->getInt("traceinput/hang_report")), m_num_threads_started(0), m_num_threads_running(0), m_done(0), m_stop_with_first_app(Sim()->getCfg()->getBool("traceinput/stop_with_first_app")), m_app_restart(Sim()->getCfg()->getBool("traceinput/restart_apps")), m_emulate_syscalls(Sim()->getCfg()->getBool("traceinput/emulate_syscalls")), m_num_apps(Sim()->getCfg()->getInt("traceinput/num_apps")), m_num_apps_nonfinish(m_num_apps), m_app_info(m_num_apps), m_tracefiles(m_num_apps), m_responsefiles(m_num_apps)
 {
    setupTraceFiles(0);
 }
@@ -237,7 +237,10 @@ thread_id_t TraceManager::newThread(app_id_t app_id, bool first, bool init_fifo,
    m_num_threads_running++;
    Thread *thread = Sim()->getThreadManager()->createThread(app_id, creator_thread_id);
    TraceThread *tthread = new TraceThread(thread, time, tracefile, responsefile, app_id, init_fifo /*cleaup*/);
-   m_threads.push_back(tthread);
+   {
+      std::lock_guard<std::mutex> tl(m_threads_lock);
+      m_threads.push_back(tthread);
+   }
    {
       std::lock_guard<std::mutex> wl(m_watch_lock);
       m_watch_threads.push_back(tthread);
@@ -252,7 +255,7 @@ thread_id_t TraceManager::newThread(app_id_t app_id, bool first, bool init_fifo,
 
 #ifdef DEBUG
    std::cout << "[TraceManager] Trace Thread (tthread)'s current SiftReader is IDentified by name: " << tthread->getSiftReader()->getFilename() << std::endl;
-   std::cout << "[TraceManager] Number of Trace Threads in the system: " << m_threads.size()  << std::endl;
+   std::cout << "[TraceManager] Number of Trace Threads in the system: " << threadsSnapshot().size()  << std::endl;
 #endif
 
    /* If userspace MimicOS is enabled, we set the current SIFT reader to the Kernel SIFT reader
@@ -467,7 +470,9 @@ void TraceManager::endApplication(TraceThread *thread, SubsecondTime time)
       answers such a call before it gets here). */
    if (thread->isStopRequested())
       return;
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+   // A copy: signalDone() below can append a thread (an application restart)
+   const std::vector<TraceThread *> threads = threadsSnapshot();
+   for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
    {
      // Abort all threads in this application, except ourselves (we should end normally soon)
      if ((*it)->getThread()->getAppId() == thread->getThread()->getAppId() && *it != thread)
@@ -519,9 +524,13 @@ void TraceManager::cleanup()
       m_watch_threads.clear();
       m_watch_closed = true;
    }
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+   std::vector<TraceThread *> threads;
+   {
+      std::lock_guard<std::mutex> tl(m_threads_lock);
+      threads.swap(m_threads);
+   }
+   for (std::vector<TraceThread *>::iterator it = threads.begin(); it != threads.end(); ++it)
      delete *it;
-   m_threads.clear();
 
    m_num_threads_running = 0;
    m_app_info.clear();
@@ -533,7 +542,8 @@ void TraceManager::cleanupAllThreads()
 {
    std::cout << "[TraceManager] Cleaning up all trace threads" << std::endl;
    // Clean up ChampSim instruction caches on all trace threads to avoid memory leaks
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+   const std::vector<TraceThread *> threads = threadsSnapshot();
+   for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
      (*it)->cleanupChampSimCache();
 }
 
@@ -555,7 +565,9 @@ void TraceManager::start()
       m_watch_closed = false;      // a later run (traceinput/num_runs) watches its new threads
    }
    m_monitor->spawn();
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+   // A copy: a thread spawned here can create another one (newThread) at once
+   const std::vector<TraceThread *> threads = threadsSnapshot();
+   for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
      (*it)->spawn();
 }
 
@@ -576,8 +588,11 @@ void TraceManager::stop()
    SimRoiEnd();
 
    // Signal threads to stop.
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
-     (*it)->stop();
+   {
+     const std::vector<TraceThread *> threads = threadsSnapshot();
+     for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
+       (*it)->stop();
+   }
 
    /* Tell every registered reader's front end to shut down.  A recorder can
       otherwise sit blocked waiting for a magic-instruction response that will
@@ -597,9 +612,12 @@ void TraceManager::stop()
       in twenty: a worker's recorder thread, still in Pin's thread-exit
       callback when the main thread's stream ended at the end of the ROI,
       read the Shutdown and exited the program before it printed them. */
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
-     if ((*it)->getThread()->isAborted())
-       (*it)->suppressShutdown();
+   {
+     const std::vector<TraceThread *> threads = threadsSnapshot();
+     for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
+       if ((*it)->getThread()->isAborted())
+         (*it)->suppressShutdown();
+   }
    m_app_reader_pool.stopAll();
 
    // Give threads some time to end.
@@ -607,8 +625,11 @@ void TraceManager::stop()
    
    // Clean up ChampSim instruction caches on all trace threads to avoid memory leaks
    // (TraceThread destructors are never called because TraceManager is never deleted)
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
-     (*it)->cleanupChampSimCache();
+   {
+     const std::vector<TraceThread *> threads = threadsSnapshot();
+     for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
+       (*it)->cleanupChampSimCache();
+   }
    
    // Some threads may be blocked (SIFT reader, syscall, etc.). Don't wait for them or we'll deadlock.
    m_done.signal();
@@ -642,7 +663,8 @@ void TraceManager::wait()
       bool pending = false;
       {
          ScopedLock sl(m_lock);
-         for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+         const std::vector<TraceThread *> threads = threadsSnapshot();
+         for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
             if ((*it)->started() && !(*it)->m_finished)
                pending = true;
       }
@@ -675,7 +697,8 @@ UInt64 TraceManager::getProgressExpect()
 UInt64 TraceManager::getProgressValue()
 {
    UInt64 value = 0;
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+   const std::vector<TraceThread *> threads = threadsSnapshot();
+   for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
    {
      uint64_t expect = (*it)->getProgressExpect();
      if (expect)
@@ -696,7 +719,8 @@ UInt64 TraceManager::getProgressValue()
 // This should only be called when already holding the thread lock to prevent migrations while we scan for a core id match
 void TraceManager::accessMemory(int core_id, Core::lock_signal_t lock_signal, Core::mem_op_t mem_op_type, IntPtr d_addr, char *data_buffer, UInt32 data_size)
 {
-   for (std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it)
+   const std::vector<TraceThread *> threads = threadsSnapshot();
+   for (std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it)
    {
      TraceThread *tthread = *it;
      assert(tthread != NULL);
@@ -756,7 +780,8 @@ void TraceManager::Monitor::run()
       has passed -- print where every thread is.  Once per stall; progress
       re-arms it.  For runs that hang with nothing in the output, which a
       debugger cannot always be attached to. */
-   const unsigned hang_seconds = Sim()->getCfg()->getInt("traceinput/hang_report");
+   // Read by the constructor: the Simulator may already be released when this thread gets here (see closeWatch())
+   const unsigned hang_seconds = m_manager->m_hang_seconds;
    // On request too, whatever hang_report is: for a run that is busy but
    // going nowhere, which the stall detection cannot see
    struct sigaction sa;
@@ -772,8 +797,7 @@ void TraceManager::Monitor::run()
    {
      sleep(1);
      bool all_finished;
-     UInt64 sig = Sim()->getClockSkewMinimizationServer()
-                  ? Sim()->getClockSkewMinimizationServer()->getGlobalTime().getFS() : 0;
+     UInt64 sig;
      {
        /* Scanned under the lock, not from a copy: TraceManager::cleanup()
           deletes the threads at the end of the run, emptying this list under
@@ -781,6 +805,12 @@ void TraceManager::Monitor::run()
           read) kept the monitor going past it -- a SIGSEGV here on the way
           out, one run of dunnington16 -n 4 in the configs suite. */
        std::lock_guard<std::mutex> wl(m_manager->m_watch_lock);
+       /* First, under the lock: after closeWatch() the Simulator, its cores and
+          its thread manager may be gone, and nothing below may run */
+       if (m_manager->m_watch_closed)
+         return;
+       sig = Sim()->getClockSkewMinimizationServer()
+             ? Sim()->getClockSkewMinimizationServer()->getGlobalTime().getFS() : 0;
        const std::vector<TraceThread *> &threads = m_manager->m_watch_threads;
        all_finished = !threads.empty();
        for (TraceThread *t : threads)
@@ -792,8 +822,6 @@ void TraceManager::Monitor::run()
          if (!t->m_finished)
            all_finished = false;
        }
-       if (m_manager->m_watch_closed)
-         return;
      }
      if (all_finished)
        return;
@@ -819,10 +847,19 @@ void TraceManager::Monitor::run()
    }
 }
 
+void TraceManager::closeWatch()
+{
+   std::lock_guard<std::mutex> wl(m_watch_lock);
+   m_watch_closed = true;
+}
+
 void TraceManager::reportHang(unsigned seconds)
 {
-   // Held throughout, so that cleanup() cannot delete a thread under the report
+   // Held throughout, so that cleanup() cannot delete a thread under the report, and so that the Simulator,
+   // which closeWatch() releases only after taking this lock, stays alive for all of it
    std::lock_guard<std::mutex> wl(m_watch_lock);
+   if (m_watch_closed)
+      return;
    const std::vector<TraceThread *> &threads = m_watch_threads;
    ClockSkewMinimizationServer *css = Sim()->getClockSkewMinimizationServer();
    fprintf(stderr, "[SNIPER] HANG REPORT: no progress for %u s; global time %" PRIu64 " ns; %zu trace threads\n",
@@ -881,14 +918,25 @@ void TraceManager::Monitor::spawn()
 
 void TraceManager::endFrontEnd()
 {
-   for(std::vector<TraceThread *>::iterator it = m_threads.begin(); it != m_threads.end(); ++it){
+   const std::vector<TraceThread *> threads = threadsSnapshot();
+   for(std::vector<TraceThread *>::const_iterator it = threads.begin(); it != threads.end(); ++it){
       if(!(*it)->m_stopped)
          (*it)->frontEndStop();
    }
 }
 
+std::vector<TraceThread *> TraceManager::threadsSnapshot() const
+{
+   std::lock_guard<std::mutex> tl(m_threads_lock);
+   return m_threads;
+}
+
+/* Callable with any lock held (createTraceBasedApplication() holds m_lock):
+   m_threads_lock is a leaf, and getThread()/getAppId()/getId() take no lock.
+   The returned thread stays valid until cleanup(), between application runs. */
 TraceThread* TraceManager::getTraceThread(app_id_t app_id, thread_id_t th)
 {
+   std::lock_guard<std::mutex> tl(m_threads_lock);
    for (int i = 0; i < (int)m_threads.size(); ++i)
    {
       TraceThread* thread = m_threads[i];

@@ -175,16 +175,31 @@ class TraceManager
       };
 
       Monitor *m_monitor;
+      /* Every trace thread, in creation order.  Read and written only while
+         holding m_threads_lock, a leaf lock: nothing else is acquired while
+         it is held, so it may be taken with m_lock (or any other lock) held.
+         getTraceThread() scans it in place; every other reader iterates a
+         copy (threadsSnapshot()), so that what it calls on a thread runs
+         without the lock.  The TraceThread objects themselves are deleted
+         only by cleanup(), between application runs. */
       std::vector<TraceThread *> m_threads;
+      mutable std::mutex m_threads_lock;
+      std::vector<TraceThread *> threadsSnapshot() const;
       /* The same threads, for the hang report: its own lock, held only to
          append or copy, so that a report can be made while m_lock is held
          by whatever has hung. */
       std::vector<TraceThread *> m_watch_threads;
+      /* The monitor thread is never joined and can outlive the Simulator.
+         It touches the Simulator (Sim(), cores, the thread manager) only
+         while holding m_watch_lock and after checking that m_watch_closed is
+         false; closeWatch() and cleanup() set it under the same lock.  A
+         leaf lock as well. */
       std::mutex m_watch_lock;
-      bool m_watch_closed = false;   // cleanup() ran: the monitor stops
+      bool m_watch_closed = false;   // closeWatch() or cleanup() ran: the monitor stops
+      const unsigned m_hang_seconds; // traceinput/hang_report, read once at construction
       volatile bool m_app_crashed = false;
       void reportHang(unsigned seconds);
-      UInt32 m_num_threads_started;
+      std::atomic<UInt32> m_num_threads_started; // polled by the monitor without m_lock
       UInt32 m_num_threads_running;
       Semaphore m_done;
       const bool m_stop_with_first_app;
@@ -252,6 +267,10 @@ class TraceManager
       void endFrontEnd(); //Ask all trace_threads to send signal to front-end to shutdown
       /* An application crashed (its last instruction never completed):
          the run ends as usual and the simulator's exit status is 1 */
+      /* The Simulator is about to be released (Simulator::release()): from
+         here on the trace monitor no longer touches it. */
+      void closeWatch();
+
       void signalAppCrashed() { m_app_crashed = true; }
       bool appCrashed() const { return m_app_crashed; }
 

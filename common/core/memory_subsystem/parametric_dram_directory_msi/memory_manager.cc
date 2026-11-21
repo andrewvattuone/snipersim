@@ -620,11 +620,14 @@ namespace ParametricDramDirectoryMSI
 		// When running userspace MimicOS, the kernel (MimicOS binary) uses physical
 		// addresses directly — skip translation for kernel-mode accesses.
 		// Only translate when the app SIFT reader is active (application code).
-		TraceThread *trace_thread = Sim()->getTraceManager()->getTraceThread(app_id, thread_id);
-		if (trace_thread->getCurrentSiftReader() == trace_thread->getKernelSiftReader()
-		    && Sim()->getMimicOS()->isUserspaceMimicosEnabled())
+		// The trace thread is looked up only when it matters: getTraceThread() takes
+		// the trace manager's thread-registry lock, and this runs on every access.
+		MimicOS *userspace_mimicos = Sim()->getMimicOS();
+		if (userspace_mimicos && userspace_mimicos->isUserspaceMimicosEnabled())
 		{
-			skip_translation = true;
+			TraceThread *trace_thread = Sim()->getTraceManager()->getTraceThread(app_id, thread_id);
+			if (trace_thread && trace_thread->getCurrentSiftReader() == trace_thread->getKernelSiftReader())
+				skip_translation = true;
 		}
 
 		LOG_ASSERT_ERROR(mem_component <= m_last_level_cache,
