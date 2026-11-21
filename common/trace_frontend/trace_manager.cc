@@ -529,6 +529,14 @@ void TraceManager::cleanup()
       std::lock_guard<std::mutex> tl(m_threads_lock);
       threads.swap(m_threads);
    }
+   /* Only finished threads may be deleted, and only then is it safe to reset
+      the per-run shutdown state below: every caller of stop() and
+      requestShutdown() runs on a trace thread, and m_finished is the last
+      thing a trace thread writes. */
+   for (std::vector<TraceThread *>::iterator it = threads.begin(); it != threads.end(); ++it)
+     LOG_ASSERT_ERROR(!(*it)->started() || (*it)->m_finished,
+                      "Trace thread %d of the last application run is still running: the next run (traceinput/num_runs) cannot start",
+                      (*it)->getThread()->getId());
    for (std::vector<TraceThread *>::iterator it = threads.begin(); it != threads.end(); ++it)
      delete *it;
 
@@ -536,6 +544,15 @@ void TraceManager::cleanup()
    m_app_info.clear();
    m_app_info.resize(m_num_apps);
    m_num_apps_nonfinish = m_num_apps;
+
+   /* Per-run state of the next application run (traceinput/num_runs). Without
+      this, the second run's stop() returned at once (m_stop_entered), so its
+      wait() never ended, and isDone() was true from its start. */
+   m_app_reader_pool.reset();             // its readers were the deleted threads'
+   m_injected_live_count.store(0);
+   m_num_threads_started.store(0);
+   m_shutdown_requested.store(false, std::memory_order_release);
+   m_stop_entered.store(false, std::memory_order_release);
 }
 
 void TraceManager::cleanupAllThreads()
@@ -563,6 +580,7 @@ void TraceManager::start()
    {
       std::lock_guard<std::mutex> wl(m_watch_lock);
       m_watch_closed = false;      // a later run (traceinput/num_runs) watches its new threads
+      ++m_watch_generation;        // and gets its own monitor (below)
    }
    m_monitor->spawn();
    // A copy: a thread spawned here can create another one (newThread) at once
@@ -782,6 +800,11 @@ void TraceManager::Monitor::run()
       debugger cannot always be attached to. */
    // Read by the constructor: the Simulator may already be released when this thread gets here (see closeWatch())
    const unsigned hang_seconds = m_manager->m_hang_seconds;
+   UInt64 generation;
+   {
+      std::lock_guard<std::mutex> wl(m_manager->m_watch_lock);
+      generation = m_manager->m_watch_generation;
+   }
    // On request too, whatever hang_report is: for a run that is busy but
    // going nowhere, which the stall detection cannot see
    struct sigaction sa;
@@ -807,7 +830,7 @@ void TraceManager::Monitor::run()
        std::lock_guard<std::mutex> wl(m_manager->m_watch_lock);
        /* First, under the lock: after closeWatch() the Simulator, its cores and
           its thread manager may be gone, and nothing below may run */
-       if (m_manager->m_watch_closed)
+       if (m_manager->m_watch_closed || m_manager->m_watch_generation != generation)
          return;
        sig = Sim()->getClockSkewMinimizationServer()
              ? Sim()->getClockSkewMinimizationServer()->getGlobalTime().getFS() : 0;
