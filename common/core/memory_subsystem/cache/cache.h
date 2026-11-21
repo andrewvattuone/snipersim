@@ -93,6 +93,24 @@ private:
 	bool m_content_log_initialized;
 	UInt64 m_total_accesses;  // Total accesses for logging trigger
 
+	// SNIPER_RL_EVENT_CHECK=1 (diagnostic, off by default): count the classified cache events passed to the CacheSet
+	// hooks and check their consistency. Its stats (rl-event-*) are registered only when enabled.
+	struct RlEventCheck
+	{
+		UInt64 fills[CacheSetEvent::NUM_FILL_KINDS] = {};
+		UInt64 invalidations[CacheSetEvent::NUM_INVALIDATION_REASONS] = {};
+		UInt64 evictions = 0;
+		UInt64 upgrade_refills_unmatched = 0; // UPGRADE_REFILL without a pending INV_UPGRADE of that line (expect 0)
+		UInt64 demand_fills_of_upgrading = 0; // DEMAND_FILL of a line with a pending INV_UPGRADE (expect 0)
+		UInt64 upgrade_overlaps = 0;          // INV_UPGRADE while another line of the set awaits its refill
+		UInt64 victims_upgrading = 0;         // victim in SHARED_UPGRADING (expect 0)
+		std::vector<std::vector<IntPtr>> pending_upgrades; // per set: lines dropped with INV_UPGRADE, not yet refilled
+		Lock lock;
+	};
+	RlEventCheck *m_rl_event_check;
+	void rlCheckInsert(UInt32 set_index, IntPtr tag, CacheSetEvent::fill_t fill, bool eviction, const CacheBlockInfo *victim);
+	void rlCheckInvalidate(UInt32 set_index, IntPtr tag, CacheSetEvent::invalidation_t reason);
+
 public:
 	std::vector<uint64_t> m_page_walk_cacheblocks;	/* timeseries stats */
 
@@ -111,7 +129,7 @@ public:
 
 	Lock &getSetLock(IntPtr addr);
 
-	bool invalidateSingleLine(IntPtr addr);
+	bool invalidateSingleLine(IntPtr addr, CacheSetEvent::invalidation_t reason = CacheSetEvent::INV_UNCLASSIFIED);
 	bool invalidateSingleLineTLB(IntPtr addr, int page_size);
 	bool containsTLB(IntPtr addr, int page_size) const;
 	CacheBlockInfo *accessSingleLine(IntPtr addr,
@@ -121,7 +139,8 @@ public:
 
 	void insertSingleLine(IntPtr addr, Byte *fill_buff,
 						  bool *eviction, IntPtr *evict_addr,
-						  CacheBlockInfo *evict_block_info, Byte *evict_buff, SubsecondTime now, CacheCntlr *cntlr = NULL, CacheBlockInfo::block_type_t btype = CacheBlockInfo::block_type_t::DATA);
+						  CacheBlockInfo *evict_block_info, Byte *evict_buff, SubsecondTime now, CacheCntlr *cntlr = NULL, CacheBlockInfo::block_type_t btype = CacheBlockInfo::block_type_t::DATA,
+						  CacheSetEvent::fill_t fill = CacheSetEvent::DEMAND_FILL);
 	void insertSingleLineTLB(IntPtr addr, Byte *fill_buff,
 							 bool *eviction, IntPtr *evict_addr,
 							 CacheBlockInfo *evict_block_info, Byte *evict_buff, SubsecondTime now, CacheCntlr *cntlr = NULL, CacheBlockInfo::block_type_t btype = CacheBlockInfo::block_type_t::DATA, int page_size = 12, IntPtr ppn = 0);

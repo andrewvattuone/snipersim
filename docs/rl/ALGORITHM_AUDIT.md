@@ -9,7 +9,7 @@ ChampSim implementations actually do, every issue found, and the agreed plan. No
 | Date | 2026-11-20 |
 | Sniper baseline | `27e0d326` (MESI fill fix, delivered sharer hint, presence tracking; see `experiments/sharer-counts/COHERENCE_VALIDATION.md`) |
 | ChampSim reference | `SCU-Senior-Design-Project`, branch `mesi-implementation`, `148b9c3` (read-only) |
-| Status | Stage 1 (simulator-independent cores and unit tests) implemented: see [`POLICY_CORES.md`](POLICY_CORES.md). Stages 2+ not started |
+| Status | Stage 1 (simulator-independent cores and unit tests) and Stage 2 (Sniper event hooks) implemented: see [`POLICY_CORES.md`](POLICY_CORES.md). Stages 3+ not started |
 
 Paths in this document:
 

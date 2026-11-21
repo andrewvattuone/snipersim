@@ -123,12 +123,13 @@ CacheSet::invalidateTLB(IntPtr tag, int page_size)
 }
 
 bool
-CacheSet::invalidate(IntPtr& tag)
+CacheSet::invalidate(IntPtr& tag, CacheSetEvent::invalidation_t reason)
 {
    for (SInt32 index = m_associativity-1; index >= 0; index--)
    {
       if (m_cache_block_info_array[index]->getTag() == tag)
       {
+         onInvalidate(index, tag, reason);
          m_cache_block_info_array[index]->invalidate();
 
          return true;
@@ -139,8 +140,13 @@ CacheSet::invalidate(IntPtr& tag)
 }
 
 void
-CacheSet::insert(CacheBlockInfo* cache_block_info, Byte* fill_buff, bool* eviction, CacheBlockInfo* evict_block_info, Byte* evict_buff, CacheCntlr *cntlr)
+CacheSet::insert(CacheBlockInfo* cache_block_info, Byte* fill_buff, bool* eviction, CacheBlockInfo* evict_block_info, Byte* evict_buff, CacheCntlr *cntlr,
+                 CacheSetEvent::fill_t fill)
 {
+   // A demand miss is reported before the victim is selected (history lookup first, docs/rl/POLICY_CORES.md)
+   if (fill == CacheSetEvent::DEMAND_FILL)
+      onMiss(cache_block_info->getTag());
+
    // This replacement strategy does not take into account the fact that
    // cache blocks can be voluntarily flushed or invalidated due to another write request
    const UInt32 index = getReplacementIndex(cntlr);
@@ -155,6 +161,7 @@ CacheSet::insert(CacheBlockInfo* cache_block_info, Byte* fill_buff, bool* evicti
 
 
       *eviction = true;
+      onEviction(index, m_cache_block_info_array[index]);
       // FIXME: This is a hack. I dont know if this is the best way to do
       evict_block_info->clone(m_cache_block_info_array[index]);
       if (evict_buff != NULL && m_blocks != NULL){
@@ -170,6 +177,7 @@ CacheSet::insert(CacheBlockInfo* cache_block_info, Byte* fill_buff, bool* evicti
 
    // FIXME: This is a hack. I dont know if this is the best way to do
    m_cache_block_info_array[index]->clone(cache_block_info);
+   onFill(index, cache_block_info->getTag(), fill);
 
 
    if (fill_buff != NULL && m_blocks != NULL)

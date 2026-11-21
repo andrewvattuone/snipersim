@@ -1,8 +1,9 @@
-# RL replacement cores (Stage 1)
+# RL replacement cores
 
 Stage 1 of the Sniper port: the two replacement algorithms as simulator-independent, header-only C++ cores with
-deterministic unit tests. **Nothing is wired into Sniper yet**: no cache hooks, no registered policy names, no change
-to `CacheSetLRU`, the MESI protocol or the sharer-hint code. The audit that motivates every decision here is
+deterministic unit tests. Stage 2: Sniper reports classified cache events to its cache sets through no-op hooks
+(see [Sniper integration](#sniper-integration)). **No RL policy is registered yet** (Stage 3); `CacheSetLRU`, the MESI
+protocol and the sharer-hint code are unchanged. The audit that motivates every decision here is
 [`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) (issue numbers I-n refer to it).
 
 | Algorithm | Core | Reference implementation (ChampSim, `mesi-implementation` `148b9c3`) |
@@ -269,38 +270,81 @@ After step 3 the weights equal the end of the illustration in [`ALGORITHM_AUDIT.
 (wE 0.08, wM 0.01, wBT 0.164, wS −0.253, wAT −0.46). This scenario is the exact sequence the cores produce when the
 events happen in Sniper's order.
 
-## Stage 2 integration interface
+## Sniper integration
 
-The adapter (planned `CacheSetRL` in `cache/`, a `CacheSet` subclass; `CacheSetLRU` untouched) owns one `LruOrder` per
-set and one policy object per cache, and maps Sniper's events as follows.
+**Stage 2 (implemented): event hooks.** Sniper reports every cache event a learning policy needs to its `CacheSet`, with
+the controller's classification. All hooks are no-ops in the base class, so every existing policy, including
+`CacheSetLRU`, behaves exactly as before. **Stage 3 (not started)** adds the `CacheSetRL` adapter that implements the
+hooks with the cores and registers the policy names.
 
-| Sniper | Core |
+### Hooks (`cache/cache_set.h`, `cache/cache_set_events.h`)
+
+```
+CacheSet::insert(block, ..., cntlr, fill)              fill = DEMAND_FILL (default) | UPGRADE_REFILL
+   onMiss(tag)                     demand fill only, BEFORE getReplacementIndex      cache_set.cc:148
+   getReplacementIndex(cntlr)      victim selection, unchanged
+   onEviction(way, victim)         a valid block is replaced; victim still holds     cache_set.cc:164
+                                   its state, tag and sharer hint
+   [clone]
+   onFill(way, tag, fill)          new block installed (the controller sets its       cache_set.cc:180
+                                   coherence state and sharer hint afterwards)
+CacheSet::invalidate(tag, reason)
+   onInvalidate(way, tag, reason)  before the block is invalidated (tag reset to ~0)  cache_set.cc:132
+updateReplacementIndex(way)        hits that update recency (unchanged)
+```
+
+`Cache::insertSingleLine(..., fill)` and `Cache::invalidateSingleLine(addr, reason)` pass the classification through.
+Both arguments default to `DEMAND_FILL` / `INV_UNCLASSIFIED`, so the TLB, page-walk cache, NUCA and DRAM-cache callers
+are unchanged.
+
+### Classification (`parametric_dram_directory_msi/cache_cntlr.cc`)
+
+Checked against the source (line numbers at the time of Stage 2):
+
+| Site | Reason | Why |
+|---|---|---|
+| `processMemOpFromCore`, L1 copy present but access not permitted (`:1012`) | `INV_UPGRADE` | Own write to an S/E line; the L2 response refills it |
+| `processShmemReqFromPrevCache`, L2 copy present but not permitted (`:1719`) | `INV_UPGRADE` | Own write to S/E; `copyDataFromNextLevel` refills it |
+| `processMemOpFromCore`, accelerator port write below the L1 (`:752`) | `INV_COHERENCE` | Another agent writes; this L1 is not refilled |
+| `updateCacheBlock(INVALID, Transition::COHERENCY)` (`:2541`) | `INV_COHERENCE` | Directory INV/FLUSH, or a shared level invalidating its other upper caches |
+| `updateCacheBlock(INVALID, Transition::UPGRADE)` | `INV_COHERENCE` | **Another** cache's write: a shared level invalidating the other cores' copies (`:1701`, `:1753`) or an L2 invalidating the sibling L1 |
+| `updateCacheBlock(INVALID, Transition::BACK_INVAL / EVICT)` | `INV_BACK_INVALIDATION` | An inclusive lower level evicted the line (`EVICT` is passed up as `BACK_INVAL`, `:2404`) |
+
+`updateCacheBlock` is always driven by another cache, which passes its own reason up the hierarchy. A cache's own
+upgrade never goes through it, so `Transition::UPGRADE` must **not** be mapped to `INV_UPGRADE`. The plan written
+before Stage 2 said otherwise; that was wrong.
+
+**Fills.** `CacheCntlr::invalidateCacheBlock(addr, INV_UPGRADE)` remembers `addr` in the controller
+(`m_upgrade_refill_address`). The controller's next `insertCacheBlock` is an `UPGRADE_REFILL` if it is that line,
+otherwise a `DEMAND_FILL`, and any insert clears the mark (`:2239`). This is sound because only the cache's own user
+thread starts an upgrade, and it re-inserts the line before that controller inserts anything else:
+
+* L3 hit: `copyDataFromNextLevel` runs synchronously.
+* L3 miss: the thread blocks in `waitForNetworkThread` and refills on wake-up (`:752-765`).
+
+The simulator thread only invalidates lines of a private cache; its fills go to the last level, whose own upgrades are
+in place (`SHARED_UPGRADING`), never invalidate-and-refill. The line tracer prints the classification
+(`INVALIDATE (was S, upgrade)`, `INSERT as M (upgrade-refill)`).
+
+**Hits.** Recency-updating hits arrive through `updateReplacementIndex`: in an L1, `accessCache(..., hit_where == this
+level && count)` (`:1162`); in an L2, `retrieveCacheBlock(..., first_hit && count)` (`:1820`). Fills and write-backs pass
+`update_replacement = false`. A learning policy therefore sees exactly the hits LRU sees.
+
+### Stage 3 adapter mapping
+
+| Hook | Core call |
 |---|---|
-| Start of `CacheSet::insert` for a demand fill, before `getReplacementIndex` | `on_miss(set, incoming tag)`: the tag is `cache_block_info->getTag()` (set by `Cache::insertSingleLine`); not for an upgrade refill |
-| `CacheSet::insert` → `getReplacementIndex(cntlr)` with an invalid way | lowest invalid way, `LruOrder::touch`; no decision |
-| `getReplacementIndex` with all ways valid | `candidates = LruOrder::candidates(K, isValidReplacement)`; `d = choose(set, candidates, info)`; `commit`; `on_eviction(set, victim tag, d.victim_features)`; `touch(victim)` |
-| After the clone of the new block in `insert` | `on_fill(set, way, tag, demand)` (or `upgrade_refill`) |
-| `updateReplacementIndex(way)` (hits with `update_replacement`) | `touch(way)`; `RewardPolicy::on_hit` |
-| `CacheSet::invalidate` | `RewardPolicy::on_invalidate(set, way, tag, reason)` |
-| Write-backs (`update_replacement = false`) | nothing |
+| `onMiss(tag)` | `on_miss(set, tag)` |
+| `getReplacementIndex` with an invalid way | lowest invalid way, `LruOrder::touch` |
+| `getReplacementIndex`, set full | `candidates = LruOrder::candidates(K, isValidReplacement)`, `d = choose(...)`, `commit`, `touch(d.victim)` |
+| `onEviction(way, victim)` | `on_eviction(set, victim->getTag(), d.victim_features)` |
+| `onFill(way, tag, fill)` | `on_fill(set, way, tag, demand / upgrade_refill)` |
+| `updateReplacementIndex(way)` | `touch(way)`, `RewardPolicy::on_hit` |
+| `onInvalidate(way, tag, reason)` | `RewardPolicy::on_invalidate` with `coherence`, `back_invalidation` or `upgrade` |
 
-`info(way)` = `make_features(map(block->getCState()), block->getSharerHint(), num_application_cores)`: local block
-state and the delivered hint only. `oracle` sharer counts stay in the diagnostics (`queryOracleSharers`) and may only be
-used in an explicitly labeled comparison mode.
-
-Hooks Sniper needs, each a no-op for every existing policy so the LRU baseline is unchanged:
-
-1. `CacheSet::insert` must notify the policy twice: at its start, before `getReplacementIndex` (`on_miss` with the
-   incoming tag, for a demand fill), and after the clone (`on_fill`). `Cache::insertSingleLine` has already set the tag
-   on the incoming `cache_block_info`. Reporting the miss at the start of the insert rather than at the controller's
-   tag check is equivalent here. Between a private L2's tag-check miss and its insert, the only events in that set are
-   invalidations from the simulator thread (coherence, back invalidation), which never touch the history, because the
-   core's user thread is blocked on the miss.
-2. `CacheSet::invalidate` (via `Cache::invalidateSingleLine`) needs the reason. `CacheCntlr::updateCacheBlock` knows
-   it (`Transition::COHERENCY`, `BACK_INVAL`, `UPGRADE`); the self-invalidations before forwarding a write
-   (`processMemOpFromCore`, `processShmemReqFromPrevCache`) must pass `upgrade`.
-3. The re-insert that follows an upgrade must be reported as `upgrade_refill`. The controller knows it is completing a
-   write to a line it held, which the cache set does not.
+`info(way)` = `make_features(map(block->getCState()), block->getSharerHint(), num application cores)`: the block's own
+state and its delivered hint, never the oracle. `queryOracleSharers` stays a diagnostic (`lru-victim`/`hint-victim`
+statistics) and may only be used in an explicitly labeled comparison mode.
 
 Things the adapter must get right (audit I-3, I-21):
 
@@ -308,9 +352,26 @@ Things the adapter must get right (audit I-3, I-21):
   read-granted M victims.
 * Coherence and back invalidations never create history entries or rewards.
 * An upgrade carries the block's metadata over and is not an eviction.
-* `SHARED_UPGRADING` ways are never candidates.
+* `SHARED_UPGRADING` ways are never candidates (`isValidReplacement`).
+* `INV_UNCLASSIFIED` should not occur in an L1/L2; the adapter treats it like a coherence invalidation (no feedback).
 * `CacheSetInfoRL` should extend `CacheSetInfoLRU` so `lru-victim-*`, `oracle-*` and `hint-*` statistics (and
   `experiments/sharer-counts/check_sharers.py`) keep working, and every parameter is printed.
+
+### Event checker
+
+`SNIPER_RL_EVENT_CHECK=1` makes every non-TLB `Cache` count the classified events and check them; its `rl-event-*`
+statistics are registered only then, so default runs are unchanged. `experiments/sharer-counts/check_rl_events.py`
+checks a run:
+
+* An upgrade refill always matches a pending own upgrade of that line, and no demand fill hits a pending one.
+* No victim is `SHARED_UPGRADING`, no invalidation is unclassified, and no two upgrades in a set overlap.
+* Upgrade invalidations equal upgrade refills.
+* Back invalidations equal the controller's `backinval-*` counters, and coherence invalidations fall within its
+  `coherency-*` counters.
+
+With `--regress WRITE READ N` it also checks that a `coherence_regress` write makes the writing core upgrade about N
+lines in its L1-D (and in its L2 when that is not the last level) while the other core's copies are invalidated by
+coherence.
 
 ## Known limitations and open questions
 
@@ -327,8 +388,16 @@ Things the adapter must get right (audit I-3, I-21):
 * **Paper ambiguities** kept as options: rule, combine, retain (only `stay` implemented, as approved). The
   boundary/polarity of the threshold follows [P24] (`> cores/2`).
 * **Delivered hint 0** (no hint) classifies as below the threshold, as ChampSim's 0. L1 caches get no hint yet (I-18).
-* **Upgrade carry-over** keeps one pending upgrade per set, matched by tag (see "Overlapping upgrades" below).
+* **Upgrade carry-over** keeps one pending upgrade per set, matched by tag (see "Overlapping upgrades" below). The
+  Stage 2 event checker counts overlaps (`rl-event-upgrade-overlap`).
 * **No hardware cost** (latency, storage, energy) is modeled; full tags and `double` weights, as in ChampSim.
+* **Invalidations that bypass the hooks.** A few controller paths call `CacheBlockInfo::invalidate()` directly instead of
+  `CacheSet::invalidate`, so no `onInvalidate` is reported:
+  * passthrough caches (`perf_model/*/passthrough`, off by default), `cache_cntlr.cc:826` and `:1493`;
+  * in an L1, page-table metadata blocks that hit while metadata passthrough applies (`:833`).
+
+  The private L2 target is not affected. For an L1 adapter, such a block simply disappears; the next `onFill` of its way
+  resets the metadata, so the only cost is a protection outcome that is never rewarded.
 
 ### Overlapping upgrades
 

@@ -4,6 +4,8 @@
 #include "stats.h"
 #include "config.hpp"
 #include "debug_config.h"
+#include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <fstream>
 #include <tuple>
@@ -141,6 +143,22 @@ Cache::Cache(
 	m_page_walk_cacheblocks.clear();
 	m_is_tlb = is_tlb;
 
+	m_rl_event_check = NULL;
+	if (!is_tlb && getenv("SNIPER_RL_EVENT_CHECK") != NULL)
+	{
+		m_rl_event_check = new RlEventCheck();
+		m_rl_event_check->pending_upgrades.resize(m_num_sets);
+		for (UInt32 f = 0; f < CacheSetEvent::NUM_FILL_KINDS; ++f)
+			registerStatsMetric(name, core_id, String("rl-event-fill-") + CacheSetEvent::fillName(CacheSetEvent::fill_t(f)), &m_rl_event_check->fills[f]);
+		for (UInt32 r = 0; r < CacheSetEvent::NUM_INVALIDATION_REASONS; ++r)
+			registerStatsMetric(name, core_id, String("rl-event-inv-") + CacheSetEvent::invalidationName(CacheSetEvent::invalidation_t(r)), &m_rl_event_check->invalidations[r]);
+		registerStatsMetric(name, core_id, "rl-event-eviction", &m_rl_event_check->evictions);
+		registerStatsMetric(name, core_id, "rl-event-upgrade-refill-unmatched", &m_rl_event_check->upgrade_refills_unmatched);
+		registerStatsMetric(name, core_id, "rl-event-demand-fill-of-upgrading", &m_rl_event_check->demand_fills_of_upgrading);
+		registerStatsMetric(name, core_id, "rl-event-upgrade-overlap", &m_rl_event_check->upgrade_overlaps);
+		registerStatsMetric(name, core_id, "rl-event-victim-upgrading", &m_rl_event_check->victims_upgrading);
+	}
+
 	for (int i = 0; i < 5; i++)
 	{
 
@@ -171,6 +189,7 @@ Cache::Cache(
 
 Cache::~Cache()
 {
+	delete m_rl_event_check;
 
 
 #ifdef ENABLE_SET_USAGE_HIST
@@ -221,7 +240,7 @@ Cache::getSetLock(IntPtr addr)
 	return m_sets[set_index]->getLock();
 }
 
-bool Cache::invalidateSingleLine(IntPtr addr)
+bool Cache::invalidateSingleLine(IntPtr addr, CacheSetEvent::invalidation_t reason)
 {
 	IntPtr tag;
 	UInt32 set_index;
@@ -237,7 +256,10 @@ bool Cache::invalidateSingleLine(IntPtr addr)
 		fake_result = m_fake_sets[0]->invalidate(tag);
 	}
 
-	result = m_sets[set_index]->invalidate(tag);
+	IntPtr checked_tag = tag;
+	result = m_sets[set_index]->invalidate(tag, reason);
+	if (m_rl_event_check && result)
+		rlCheckInvalidate(set_index, checked_tag, reason);
 
 	return result || fake_result;
 }
@@ -361,7 +383,7 @@ void Cache::insertSingleLine(IntPtr addr, Byte *fill_buff,
 							 bool *eviction, IntPtr *evict_addr,
 							 CacheBlockInfo *evict_block_info, Byte *evict_buff,
 							 SubsecondTime now, CacheCntlr *cntlr,
-							 CacheBlockInfo::block_type_t btype)
+							 CacheBlockInfo::block_type_t btype, CacheSetEvent::fill_t fill)
 {
 	IntPtr tag;
 	UInt32 set_index;
@@ -383,7 +405,9 @@ void Cache::insertSingleLine(IntPtr addr, Byte *fill_buff,
 	else
 	{
 		m_sets[set_index]->insert(cache_block_info, fill_buff,
-								  eviction, evict_block_info, evict_buff, cntlr);
+								  eviction, evict_block_info, evict_buff, cntlr, fill);
+		if (m_rl_event_check)
+			rlCheckInsert(set_index, tag, fill, *eviction, evict_block_info);
 	}
 
 	*evict_addr = tagToAddress(evict_block_info->getTag());
@@ -865,4 +889,43 @@ Cache::logCacheContentDistribution(UInt64 access_count)
 #endif
 
 #endif // DEBUG_L2_CONTENT
+}
+
+// SNIPER_RL_EVENT_CHECK: an upgrade refill must re-insert a line this cache dropped with INV_UPGRADE (and a demand
+// fill must not), and no victim may be SHARED_UPGRADING. See docs/rl/POLICY_CORES.md.
+void Cache::rlCheckInsert(UInt32 set_index, IntPtr tag, CacheSetEvent::fill_t fill, bool eviction, const CacheBlockInfo *victim)
+{
+	ScopedLock sl(m_rl_event_check->lock);
+	RlEventCheck &c = *m_rl_event_check;
+	++c.fills[fill];
+	if (eviction)
+	{
+		++c.evictions;
+		if (victim->getCState() == CacheState::SHARED_UPGRADING)
+			++c.victims_upgrading;
+	}
+	std::vector<IntPtr> &pending = c.pending_upgrades[set_index];
+	std::vector<IntPtr>::iterator it = std::find(pending.begin(), pending.end(), tag);
+	if (it != pending.end())
+	{
+		pending.erase(it);
+		if (fill != CacheSetEvent::UPGRADE_REFILL)
+			++c.demand_fills_of_upgrading;
+	}
+	else if (fill == CacheSetEvent::UPGRADE_REFILL)
+		++c.upgrade_refills_unmatched;
+}
+
+void Cache::rlCheckInvalidate(UInt32 set_index, IntPtr tag, CacheSetEvent::invalidation_t reason)
+{
+	ScopedLock sl(m_rl_event_check->lock);
+	RlEventCheck &c = *m_rl_event_check;
+	++c.invalidations[reason];
+	if (reason == CacheSetEvent::INV_UPGRADE)
+	{
+		std::vector<IntPtr> &pending = c.pending_upgrades[set_index];
+		if (!pending.empty())
+			++c.upgrade_overlaps;
+		pending.push_back(tag);
+	}
 }

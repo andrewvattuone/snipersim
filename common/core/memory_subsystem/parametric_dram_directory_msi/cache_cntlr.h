@@ -270,6 +270,11 @@ namespace ParametricDramDirectoryMSI
          bool m_l1_metadata_mshr;
          int mshr_size;
 
+         // RL cache events (docs/rl/POLICY_CORES.md): the line this controller last dropped with INV_UPGRADE. Its next
+         // insert by this controller is the UPGRADE_REFILL of that line; any insert clears it.
+         bool m_upgrade_refill_pending = false;
+         IntPtr m_upgrade_refill_address = 0;
+
 
 
          struct {
@@ -453,7 +458,11 @@ namespace ParametricDramDirectoryMSI
          SharedCacheBlockInfo* setCacheState(IntPtr address, CacheState::cstate_t cstate);
 
          // Cache data operations
-         void invalidateCacheBlock(IntPtr address);
+         // `reason` classifies the invalidation for the replacement policy (cache_set_events.h); INV_UPGRADE marks the
+         // line's next insert by this controller as an UPGRADE_REFILL
+         void invalidateCacheBlock(IntPtr address, CacheSetEvent::invalidation_t reason);
+         // Invalidation reason, as seen by this cache, of an updateCacheBlock(INVALID) with this transition reason
+         static CacheSetEvent::invalidation_t invalidationReason(Transition::reason_t reason);
          void retrieveCacheBlock(IntPtr address, Byte* data_buf, ShmemPerfModel::Thread_t thread_num, bool update_replacement);
 
 

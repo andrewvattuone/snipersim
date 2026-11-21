@@ -748,7 +748,8 @@ namespace ParametricDramDirectoryMSI
 						m_next_cache_cntlr->writeCacheBlock(ca_address, 0, buf, getCacheBlockSize(), ShmemPerfModel::_USER_THREAD);
 					setCacheState(ca_address, CacheState::SHARED);
 				}
-				invalidateCacheBlock(ca_address);
+				// Not an upgrade of this L1: the accelerator writes below it and this L1 is not refilled
+				invalidateCacheBlock(ca_address, CacheSetEvent::INV_COHERENCE);
 			}
 			hit_where = m_next_cache_cntlr->processShmemReqFromPrevCache(eip, this, mem_op_type, ca_address, offset, data_length, modeled, count, block_type, Prefetch::NONE, t_start, false, mem_origin);
 			if (hit_where == HitWhere::MISS)
@@ -1006,8 +1007,9 @@ namespace ParametricDramDirectoryMSI
 			// Invalidate the cache block before passing the request to L2 Cache
 			if (getCacheState(ca_address) != CacheState::INVALID)
 			{
+				// The line is present but the access is not permitted: a write to S/E. The L2 response refills it.
 				// std::cout << "Invalidate: " << __LINE__ << std::endl;
-				invalidateCacheBlock(ca_address);
+				invalidateCacheBlock(ca_address, CacheSetEvent::INV_UPGRADE);
 			}
 
 			#ifdef CACHE_DEBUG
@@ -1712,8 +1714,9 @@ namespace ParametricDramDirectoryMSI
 			{
 				if (cache_block_info)
 				{
+					// Present but not permitted: a write to S/E. copyDataFromNextLevel refills it below.
 					// std::cout << "Invalidate: " << __LINE__ << std::endl;
-					invalidateCacheBlock(address);
+					invalidateCacheBlock(address, CacheSetEvent::INV_UPGRADE);
 				}
 
 				// let the next cache level handle it.
@@ -2159,16 +2162,39 @@ namespace ParametricDramDirectoryMSI
 		return cache_block_info;
 	}
 
+	CacheSetEvent::invalidation_t
+	CacheCntlr::invalidationReason(Transition::reason_t reason)
+	{
+		// updateCacheBlock is always driven by another cache: the reason describes what that cache is doing.
+		switch (reason)
+		{
+		case Transition::COHERENCY: // directory INV/FLUSH, or a shared level invalidating its other upper caches
+		case Transition::UPGRADE:   // another core's / sibling cache's write; never this cache's own upgrade
+			return CacheSetEvent::INV_COHERENCE;
+		case Transition::BACK_INVAL: // an inclusive lower level evicted the line (EVICT is passed up as BACK_INVAL)
+		case Transition::EVICT:
+			return CacheSetEvent::INV_BACK_INVALIDATION;
+		default:
+			return CacheSetEvent::INV_UNCLASSIFIED;
+		}
+	}
+
 	void
-	CacheCntlr::invalidateCacheBlock(IntPtr address)
+	CacheCntlr::invalidateCacheBlock(IntPtr address, CacheSetEvent::invalidation_t reason)
 	{
 		__attribute__((unused)) CacheState::cstate_t old_cstate = getCacheState(address);
 		assert(old_cstate != CacheState::MODIFIED);
 		assert(old_cstate != CacheState::INVALID);
 
-		m_master->m_cache->invalidateSingleLine(address);
+		m_master->m_cache->invalidateSingleLine(address, reason);
+		if (reason == CacheSetEvent::INV_UPGRADE)
+		{
+			m_upgrade_refill_pending = true;
+			m_upgrade_refill_address = address;
+		}
 		if (LineTracer::matchesPhysical(address))
-			LineTracer::print("  %s c%d INVALIDATE (was %c)", MemComponentString(m_mem_component), m_core_id, CStateString(old_cstate));
+			LineTracer::print("  %s c%d INVALIDATE (was %c, %s)", MemComponentString(m_mem_component), m_core_id, CStateString(old_cstate),
+				CacheSetEvent::invalidationName(reason));
 
 		if (m_next_cache_cntlr)
 			m_next_cache_cntlr->notifyPrevLevelEvict(m_core_id_master, m_mem_component, address);
@@ -2209,13 +2235,18 @@ namespace ParametricDramDirectoryMSI
 		Byte evict_buf[getCacheBlockSize()];
 
 		LOG_ASSERT_ERROR(getCacheState(address) == CacheState::INVALID, "we already have this line, can't add it again");
+		// Re-inserting the line this controller dropped for its own upgrade is an upgrade refill, not a miss
+		const CacheSetEvent::fill_t fill = (m_upgrade_refill_pending && m_upgrade_refill_address == address)
+			? CacheSetEvent::UPGRADE_REFILL : CacheSetEvent::DEMAND_FILL;
+		m_upgrade_refill_pending = false;
 		m_master->m_cache->insertSingleLine(address, data_buf,
 											&eviction, &evict_address, &evict_block_info, evict_buf,
-											getShmemPerfModel()->getElapsedTime(thread_num), this, block_type);
+											getShmemPerfModel()->getElapsedTime(thread_num), this, block_type, fill);
 
 		SharedCacheBlockInfo *cache_block_info = setCacheState(address, cstate);
 		if (LineTracer::matchesPhysical(address))
-			LineTracer::print("  %s c%d INSERT as %c", MemComponentString(m_mem_component), m_core_id, CStateString(cstate));
+			LineTracer::print("  %s c%d INSERT as %c (%s)", MemComponentString(m_mem_component), m_core_id, CStateString(cstate),
+				CacheSetEvent::fillName(fill));
 		if (eviction && LineTracer::matchesPhysical(evict_address))
 			LineTracer::print("  %s c%d EVICT (was %c)", MemComponentString(m_mem_component), m_core_id, CStateString(evict_block_info.getCState()));
 
@@ -2507,7 +2538,7 @@ namespace ParametricDramDirectoryMSI
 				if (m_coherent)
 				{
 					// std::cout << "Invalidate: " << __LINE__ << std::endl;
-					invalidateCacheBlock(address);
+					invalidateCacheBlock(address, invalidationReason(reason));
 				}
 			}
 			else if (new_cstate == CacheState::SHARED)

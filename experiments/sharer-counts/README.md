@@ -27,6 +27,7 @@ coherence regression test for the MESI fill-state fix; see `COHERENCE_VALIDATION
 | `run_regress.sh` | runs `coherence_regress` (write vs. read control, clean and dirty, plus a traced 1-line run) |
 | `check_regress.py` | checks a write/read pair against MESI: invalidations, coherence misses, downgrades |
 | `compare_coherence.py` | before/after table of time, IPC, misses, coherence events and victim states |
+| `check_rl_events.py` | checks the cache events reported to replacement policies (`SNIPER_RL_EVENT_CHECK=1` runs; `--regress` for `coherence_regress` pairs) |
 | `compare_stats.py` | diffs two runs while ignoring the diagnostic stats |
 | `timing.sh` | interleaved host-time comparison of several saved Sniper binaries |
 
@@ -60,6 +61,7 @@ Coherence regression test and tracing (see `COHERENCE_VALIDATION.md`):
 ```
 experiments/sharer-counts/run_regress.sh regress -n 2 -c gainestown
 SNIPER_COHERENCE_CHECK=1 ./run-sniper ...     # counts write hits that MESI forbids
+SNIPER_RL_EVENT_CHECK=1 ./run-sniper ...      # counts/checks the events reported to replacement policies (rl-event-*)
 SNIPER_TRACE_VADDR=0x404100 ./run-sniper ...  # [LINETRACE] of one line (address from nm)
 ```
 
