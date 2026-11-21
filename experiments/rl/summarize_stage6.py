@@ -3,11 +3,20 @@
 
 Usage: summarize_stage6.py OUTDIR [--csv FILE]
 
-Runs: with several manifest lines for one run, the last is used. Only runs whose status is "ok" and whose sim.stats
-has the core statistics are used; the others are listed as failures with the reason. The summary also reports
-whether the runs share one commit and simulator binary, and checks that within each workload and L3 size every
-run's sim.cfg equals the first LRU run's apart from the replacement-policy keys (replacement_policy and the sf/,
-rl/ and rl_diag/ sections of perf_model/l2_cache) and the run-specific output_dir and trace_prefix.
+Runs: with several manifest lines for one run, the last is used. A run is used only if its status is "ok", every
+applicable check passed (check_sharers and check_rl_events, plus check_rl_policy for the RL policies), and its
+sim.stats has the core statistics. The check verdicts come from the manifest ("checks", recorded by run_stage6.py
+per run); for manifests written before that field existed, from the per-run RESULT lines in OUTDIR/checkers.txt.
+A run without a recorded passing verdict for every check is not used. Unused runs are listed with the reason.
+
+Consistency (over the used runs): one commit and one simulator binary, no run from a tree with uncommitted
+simulator changes, and within each workload and L3 size one workload command, binary and input, and a sim.cfg
+equal to the first LRU run's apart from the replacement-policy keys (replacement_policy and the sf/, rl/ and
+rl_diag/ sections of perf_model/l2_cache) and the run-specific output_dir and trace_prefix.
+
+Exit status: 0 if every run is used and the runs are consistent; otherwise the sum of 1 (some run unusable: failed,
+check failed or not recorded, or statistics unusable) and 2 (inconsistent runs), with an ERROR line for each problem
+and a final "NOT A VALID COMPARISON" line. The tables are still printed, for diagnosis.
 
 Metrics (all cores; the whole run, or the region of interest for --roi workloads, as sim.stats covers):
   ipc            sum(core.instructions) / performance_model.cycle_count (aggregate over the 4 cores)
@@ -33,6 +42,7 @@ import re
 import statistics
 import sys
 
+CHECKS = ('check_sharers.py', 'check_rl_events.py', 'check_rl_policy.py')
 POLICY_KEYS = ('perf_model/l2_cache/sf', 'perf_model/l2_cache/rl', 'perf_model/l2_cache/rl_diag')
 RUN_SPECIFIC = ('output_dir', 'trace_prefix')
 
@@ -62,6 +72,41 @@ def load_cfg(run):
                 continue
             cfg[(sec, k)] = v
     return cfg
+
+
+def legacy_checks(outdir):
+    """{(script, run_dir): passed} from the RESULT lines of OUTDIR/checkers.txt (runs before per-run verdicts)."""
+    found, script, run = {}, None, None
+    path = os.path.join(outdir, 'checkers.txt')
+    if not os.path.exists(path):
+        return found
+    for line in open(path):
+        m = re.match(r'^### (\S+)', line)
+        if m:
+            script, run = m.group(1), None
+        elif line.startswith('== ') and script:
+            run = re.sub(r'(/simulation)?(/sim\.stats)?(:.*)?$', '', line[3:].strip())
+        elif line.strip().startswith('RESULT') and script and run:
+            found[(script, os.path.abspath(run))] = found.get((script, os.path.abspath(run)), True) and line.split()[1] == 'PASS'
+            run = None
+    return found
+
+
+def check_verdicts(j, legacy):
+    """(all applicable checks passed, description) for a manifest entry."""
+    need = CHECKS if j['policy'] != 'lru' else CHECKS[:2]
+    if 'checks' in j:
+        got = {k: v for k, v in j['checks'].items()}
+        source = 'manifest'
+    else:
+        got = {c: legacy[(c, os.path.abspath(j['dir']))] for c in need if (c, os.path.abspath(j['dir'])) in legacy}
+        source = 'checkers.txt'
+    missing = [c for c in need if c not in got]
+    failed = [c for c in need if c in got and not got[c]]
+    if failed or missing:
+        return False, (f'check failed: {", ".join(failed)}' if failed else '') + ('; ' if failed and missing else '') \
+            + (f'no recorded verdict ({source}): {", ".join(missing)}' if missing else '')
+    return True, ''
 
 
 def metrics(s):
@@ -121,10 +166,16 @@ def metrics(s):
 def main(argv):
     outdir = argv[0]
     jobs = list({j['name']: j for j in (json.loads(l) for l in open(os.path.join(outdir, 'manifest.jsonl')))}.values())
-    failed, rows, used = [], [], []
+    legacy = legacy_checks(outdir)
+    failed, rows, used, errors = [], [], [], []
     for j in jobs:
         if j['status'] != 'ok':
-            failed.append((j['name'], j['status'] + (' (timeout)' if j.get('timed_out') else '') + (' (crash)' if j.get('crashed') else '')))
+            failed.append((j['name'], j['status'] + (' (timeout)' if j.get('timed_out') else '') + (' (crash)' if j.get('crashed') else '')
+                           + ''.join(f', {k} FAIL' for k, v in j.get('checks', {}).items() if not v)))
+            continue
+        passed, why = check_verdicts(j, legacy)
+        if not passed:
+            failed.append((j['name'], why))
             continue
         try:
             m = metrics(load(j['dir']))
@@ -140,12 +191,16 @@ def main(argv):
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
             w.writerows(rows)
-    print(f'{len(rows)} of {len(jobs)} runs usable' + (''.join(f'\n  FAILED {n}: {why}' for n, why in failed)))
+    print(f'{len(rows)} of {len(jobs)} runs usable' + (''.join(f'\n  ERROR: not used: {n}: {why}' for n, why in failed)))
     prov = {(j.get('commit', 'not recorded'), j.get('binary_md5', 'not recorded')) for j in used}
-    print('provenance (commit, simulator md5): ' + '; '.join(f'{c[:12]} {b}' for c, b in sorted(prov))
-          + ('  WARNING: runs from different builds' if len(prov) > 1 else ''))
-    if any(not j.get('tree_clean', True) for j in used):
-        print('  WARNING: some runs were made with uncommitted simulator changes')
+    print('provenance (commit, simulator md5): ' + '; '.join(f'{c[:12]} {b}' for c, b in sorted(prov)))
+    if len(prov) > 1:
+        errors.append('runs from different simulator builds: ' + '; '.join(
+            f'{c[:12]} {b}: {sum((j.get("commit", "not recorded"), j.get("binary_md5", "not recorded")) == (c, b) for j in used)} runs'
+            for c, b in sorted(prov)))
+    dirty = [j['name'] for j in used if not j.get('tree_clean', True)]
+    if dirty:
+        errors.append(f'{len(dirty)} runs made with uncommitted simulator changes (tree_clean false): {dirty[:3]}')
     groups = {}
     for r in rows:
         groups.setdefault((r['workload'], r['l3'], r['policy']), []).append(r)
@@ -158,13 +213,19 @@ def main(argv):
             c = load_cfg(j['dir'])
             diff = sorted(set(ref.items()) ^ set(c.items()))
             if diff:
-                bad.append((j['name'], diff[:4]))
+                bad.append(f'{j["name"]}: ' + ', '.join(f'[{sec}] {k}: {ref.get((sec, k), "absent")} vs {c.get((sec, k), "absent")}'
+                                                        for sec, k in dict.fromkeys(k for k, _ in diff)))
         cmds = {tuple(j['cmd'][j['cmd'].index('--'):]) for j in g}
         inputs = {(j.get('workload_md5'), j.get('stdin_md5')) for j in g}
         print(f'config check {w} L3 {l3}: {len(g)} runs vs {g[0]["name"]}: '
-              + ('identical apart from the policy keys' if not bad else f'DIFFERENT in {bad}')
-              + ('' if len(cmds) == 1 else f'; WARNING: {len(cmds)} different workload commands')
-              + ('' if len(inputs) == 1 else f'; WARNING: {len(inputs)} different workload binaries or inputs'))
+              + ('identical apart from the policy keys' if not bad else f'{len(bad)} runs DIFFER'))
+        errors += [f'{w} L3 {l3}: sim.cfg differs beyond the policy keys: {b}' for b in bad]
+        if len(cmds) > 1:
+            errors.append(f'{w} L3 {l3}: {len(cmds)} different workload commands: {sorted(cmds)}')
+        if len(inputs) > 1:
+            errors.append(f'{w} L3 {l3}: {len(inputs)} different workload binaries or inputs (md5): {sorted(map(str, inputs))}')
+    for e in errors:
+        print(f'  ERROR: {e}')
     cols = ['ipc', 'time_us', 'l1d_mpki', 'l2_mpki', 'l2_miss', 'l2_inval', 'l2_dirty_evict', 'l3_miss', 'dram_rd', 'dram_wr']
     order = ['lru', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4']
     for (w, l3) in sorted({(k[0], k[1]) for k in groups}):
@@ -215,7 +276,12 @@ def main(argv):
                                                  for p in order if groups.get((w, l3, p))))
         walls = lambda p: '/'.join('%.0f' % r['wall_s'] for r in groups.get((w, l3, p), []))
         print('  wall-clock s: ' + ', '.join(p + ' ' + walls(p) for p in order if groups.get((w, l3, p))))
-    return 1 if failed else 0
+    status = (1 if failed else 0) + (2 if errors else 0)
+    if status:
+        print(f'\nNOT A VALID COMPARISON (exit {status}): ' + ', '.join(
+            x for x, c in ((f'{len(failed)} runs not used', failed), (f'{len(errors)} consistency errors', errors)) if c), file=sys.stderr)
+        print(f'NOT A VALID COMPARISON (exit {status})')
+    return status
 
 
 if __name__ == '__main__':

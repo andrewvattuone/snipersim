@@ -43,12 +43,22 @@ trace prefix.
 | Simulator | this Sniper fork | Sniper 7.3 |
 
 **Tools** (`experiments/rl/`):
-* **`run_stage6.py`** runs the matrix (workloads × L3 sizes × policies × repetitions) with a per-run timeout.
-  * It never reuses a run directory.
-  * It writes `manifest.jsonl`: per run, the exact command, git commit, binary checksum, exit status, wall time
-    and status. A run is `ok` only if it exited 0, wrote statistics and logged no exception.
-  * It runs `check_sharers.py`, `check_rl_events.py` and `check_rl_policy.py` on every completed run
-    (`checkers.txt`).
+* **`run_stage6.py`** runs the matrix (workloads × L3 sizes × policies × repetitions).
+  * **Timeouts:** each workload has its own per-run bound, about 2 × its measured wall time with 4-5 simulations
+    in parallel. Ocean `small` gets 3,000 s (measured 1,443 s) and Barnes 4,096 gets 2,400 s (measured 1,103 s).
+    `--timeout` overrides every bound. A timed-out run's whole session is killed, including SDE's `pind`.
+  * **Checks:** as each simulation completes, `check_sharers.py` and `check_rl_events.py` run on it alone, plus
+    `check_rl_policy.py` for the RL policies. A check passes only if the checker exits 0 and reports
+    `RESULT PASS` and no `RESULT FAIL`. The output is appended to `checkers.txt`.
+  * **Manifest:** `manifest.jsonl` has one line per run, written as it finishes. It records the exact command,
+    stdin file, git commit, clean-tree flag, the simulator, workload and input checksums, the timeout, the exit
+    status, the wall time, the verdict of each check, and the status.
+  * **Status:** `ok` only if the run exited 0 in time, wrote statistics, logged no exception, entered and left
+    the ROI (for `--roi` workloads) and passed every check. Anything else is `FAILED` or `FAILED (checks)`.
+  * **No overwriting:** an existing run directory is never reused, overwritten or recorded again; it is skipped.
+  * **Exit status:** 0 only if every requested run was simulated now and is `ok`, 1 if any failed, and 3 if
+    some were skipped. With every run skipped it prints "NO NEW RESULTS", so an empty batch cannot pass for a
+    completed one.
 * **`summarize_stage6.py`** computes per-run metrics (`metrics.csv`), the mean and spread per configuration, the
   change against LRU, and the RL behaviour.
   * Its extraction was checked against an independent recomputation from the raw `sim.stats` (IPC, L2 MPKI, L2
@@ -56,8 +66,18 @@ trace prefix.
   * Metrics cover all cores, over the whole run, or over the region of interest for `--roi` workloads (then
     `sim.stats` is exactly the `roi-begin`..`roi-end` delta). IPC is the sum of instructions divided by the global
     cycle count, i.e. aggregate over the 4 cores.
-  * It checks that the runs of each workload and L3 size share one commit and binary and that their `sim.cfg`
-    differ only in the policy keys, and reports failed, timed-out, or statistics-less runs instead of using them.
+  * **Runs it uses:** only `ok` runs with a recorded passing verdict for every applicable check. The verdicts
+    come from the manifest, or for the three earlier result sets, written before per-run verdicts, from the
+    per-run `RESULT` lines of their `checkers.txt`. Failed, unchecked and statistics-less runs are listed and not
+    used.
+  * **Consistency checks**, each an error:
+    * the runs come from more than one commit or simulator binary;
+    * a run was made with uncommitted simulator changes;
+    * within a workload and L3 size, a `sim.cfg` differs beyond the policy keys, or the workload command, binary
+      or input differs.
+  * **Exit status:** 0 only for a valid comparison. Otherwise 1 (runs not used) plus 2 (consistency errors), with
+    an `ERROR` line per problem and a final "NOT A VALID COMPARISON". The tables are still printed, for
+    diagnosis.
 * **Provenance:** the manifest's `commit` and `binary_md5` identify the simulator. The `git_revision` in each
   run's `sim.info` is not reliable: it is a CMake configure-time label (`build/default/config/sniper.py`), still
   `12eda347` from Stage 4 although the binary was rebuilt from `9bcf5e45`.
@@ -159,7 +179,12 @@ In FFT 89-92% of history entries are M, so S and E blocks are kept and the next 
 `ba6004fd2b251be0ee5fc9e5d77374f1d4c80317` (2024-02-10), cloned to `../sniper-benchmarks`, beside this tree and
 outside it. No tracked file of that repository is modified.
 
-**Build** (`experiments/rl/build_splash2.sh`, verified from a clean clone):
+**Build** (`experiments/rl/build_splash2.sh`):
+* **Revision:** without an existing checkout it clones the repository and checks out the pinned revision. It refuses
+  an existing checkout at another revision, or with modified tracked files, instead of changing it.
+* **Verification:** a fresh GitHub clone rebuilt with it gives programs identical in machine code and read-only
+  data to those used here; only the debug info differs, because it records the build path. The Sniper tree is
+  unchanged by a build.
 * Only the ROI hooks library and four programs are built: Radix, LU (contiguous blocks), Ocean (contiguous
   partitions) and Barnes. Nothing is installed, and no Sniper is built or downloaded.
 * The hooks are compiled against this tree's `include/sim_api.h`.
@@ -265,8 +290,8 @@ before any 1 MB L3 runs.
     evictions. That measures an L3 effect more than the L2 policy.
 * **Then at 1 MB:** one LRU qualification run per workload (2 runs) can follow.
 * **Expected cost**, measured LRU times with diagnostics adding a little for the RL policies:
-  * Ocean: about 1,450 s per run.
-  * Barnes: about 1,100 s per run.
+  * Ocean: about 1,450 s per run, against a 3,000 s timeout.
+  * Barnes: about 1,100 s per run, against a 2,400 s timeout.
   * At 8 in parallel (the host has 20 hardware threads, each simulation uses about 2.3), 20 runs take about
     1-1.5 h.
 * **Five repetitions:** only after that pilot, for the configurations whose difference from LRU is near the

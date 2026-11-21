@@ -3,7 +3,8 @@
 #
 # Usage: experiments/rl/build_splash2.sh [BENCH_DIR]   (default: ../sniper-benchmarks next to this Sniper tree)
 #
-# Source: https://github.com/snipersim/benchmarks at revision $REV (cloned if BENCH_DIR does not exist).
+# Source: https://github.com/snipersim/benchmarks at revision $REV. If BENCH_DIR does not exist it is cloned and
+# checked out at $REV; an existing BENCH_DIR at another revision, or with modified tracked files, is refused, not changed.
 # Only the SPLASH-2 ROI hooks library and Radix, LU (contiguous blocks), Ocean (contiguous partitions) and Barnes
 # are built. Nothing is installed, and no Sniper is built: the hooks are compiled against THIS tree's
 # include/sim_api.h, and the programs are run with this tree's run-sniper (run_stage6.py), not with the
@@ -19,10 +20,14 @@ set -euo pipefail
 REV=ba6004fd2b251be0ee5fc9e5d77374f1d4c80317
 SNIPER_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BENCH=${1:-$(dirname "$SNIPER_ROOT")/sniper-benchmarks}
-[ -d "$BENCH" ] || git clone https://github.com/snipersim/benchmarks.git "$BENCH"
+if [ ! -e "$BENCH" ]; then
+  # A new clone is checked out at the pinned revision; an existing checkout is never changed
+  git clone https://github.com/snipersim/benchmarks.git "$BENCH"
+  git -C "$BENCH" checkout --quiet --detach "$REV"
+fi
 BENCH=$(cd "$BENCH" && pwd)
 have=$(git -C "$BENCH" rev-parse HEAD)
-[ "$have" = "$REV" ] || { echo "benchmarks at $have, expected $REV (git -C $BENCH checkout $REV)" >&2; exit 1; }
+[ "$have" = "$REV" ] || { echo "benchmarks at $have, expected $REV; not changing an existing checkout (git -C $BENCH checkout $REV)" >&2; exit 1; }
 [ -z "$(git -C "$BENCH" status --porcelain --untracked-files=no)" ] || { echo "tracked files modified in $BENCH" >&2; exit 1; }
 export BENCHMARKS_ROOT=$BENCH SNIPER_ROOT GRAPHITE_ROOT=$SNIPER_ROOT
 
