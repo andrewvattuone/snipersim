@@ -652,9 +652,212 @@ The simulator binary used is kept beside it as `results/stage6-capbench-lu-ablat
   * **Reuse near the L2's capacity edge:** 72.6% of LRU's L2 hits are at stack positions 4-7, and rl-n4's
     eviction-history returns are 9.6 MPKI.
   * **rl-n4 there:** −0.85% L2 misses in Pilot 3, within noise.
-  * **Plan:** the same five policies with the same controls (the LU-derived frozen vector and seed 1, not retuned),
-    two repetitions. For Ocean the frozen vector is out of sample.
-  * **Cost:** about 1,550 s per run.
+  * **Done:** the same five policies with the same controls (the LU-derived frozen vector and seed 1, not retuned),
+    two repetitions. See "Ocean `small` no-learning comparison" below.
 * **A corrected LU variant** (not implemented). The minimal fix is in `lower_upper.c` (`>` instead of `<` in the
   pivot search, and the parenthesis at line 93), built as a separate, labelled variant; the factorization must
   then be checked natively.
+
+## Ocean `small` no-learning comparison (`results/stage6-ocean-ablation`, archived)
+
+The independent check of the LU `tiny` ablation above, on a validated workload: SPLASH-2 Ocean (contiguous
+partitions), validated in Pilot 3 of [`STAGE6_PILOTS.md`](STAGE6_PILOTS.md), with correct output and no known
+defect.
+
+**Setup:**
+* **Runs:** `lru`, `rl-n4`, `rl-n4-frozen`, `rl-n4-prio`, `rl-n4-rand`, two repetitions each (10 runs), 4 at a
+  time (the last two ran together).
+* **Command:** `run_stage6.py results/stage6-ocean-ablation --workloads ocean-small --policies
+  lru,rl-n4,rl-n4-frozen,rl-n4-prio,rl-n4-rand --reps 2 --jobs 4`.
+* **Configuration:** identical to Pilot 3's Ocean runs (`results/stage6-ocean-barnes-pilot`):
+  * `OCEAN -n258 -p4`, the complete ROI;
+  * 4 Gainestown cores, the policy on the private L2 only, 8 MB shared L3, prefetchers off;
+  * timeout 3,000 s.
+  * **Configuration check:** the `sim.cfg` of `lru` and `rl-n4` differs from the pilot's only in the output
+    directory, the temporary trace prefix and an empty `[perf_model/l2_cache/rl/initial_weights]` section
+    header from the new base configuration.
+* **Controls:** exactly as in the LU ablation, not retuned for Ocean.
+  * **Base:** rl-n4 (mode both, window 4, alpha 0.1, protection feedback on, global weights) plus
+    `learning=false`.
+  * **`rl-n4-frozen`:** S −0.09, E −0.38, M −0.76, BT −0.64, AT 0.0. The vector was learned on LU, so it is out
+    of sample here.
+  * **`rl-n4-prio`:** `selection=priority`. The rule was motivated by LU, so it is also not tuned to Ocean.
+  * **`rl-n4-rand`:** `selection=random`, `random_rate=0.083`, `seed=1`, with the same per-core streams as on LU
+    (`910a2dec…`, `204391a6…`, `c4858308…`, `8107abdb…`, printed in each run's CONTROL line).
+* **Build:** `feature/rl-port` 6da9b094, with a clean worktree; one simulator binary for all 10 runs (md5
+  `e65141e5…`, the main tree's `build/default/lib/sniper`). Its compiled sources are those of f4383d3a.
+  * **The only difference from the LU ablation binary (`deafea4e…`) is the build location.** The checks:
+    * **Symbols:** the same 8,246 symbols, each with the same size and type.
+    * **Code:** the same `.text` after masking addresses.
+    * **Strings:** only the embedded source paths and the RUNPATH differ.
+    * **Replays:** deterministic replays of all five policies on the LU and FFT traces gave identical
+      statistics, with all checkers passing (`results/stage6-rebuild-verification`).
+  * **The validated binary of the earlier pilots** (`192619ee…`) is kept unchanged as
+    `results/stage6-validated-sniper-192619ee`.
+  * **Workload:** the OCEAN executable (md5 `4ce36666…`) is the pilot's.
+* **Outcome:** no crashes or timeouts, exit 0 for every run; 0 stale write hits; wall time 1,031-1,420 s per run.
+  * **Checkers:** all 28 checker runs pass (`check_sharers` and `check_rl_events` on every run,
+    `check_rl_policy` on the 8 `rl_lru` runs).
+* **Weights:** the frozen and control weights stayed at their configured values in every snapshot, statistics
+  prefix and core (deviation 0), and every core printed the CONTROL line.
+
+**Every repetition** (`analysis.txt`, `metrics-per-run.csv`; both CSV files hold all 10 runs):
+
+| Policy | Rep | Instructions (M) | IPC | Simulated time (µs) | L2 misses | L2 MPKI | L2 demand misses | L2 dirty evictions | L2 invalidations | L2 downgrades | L3 misses | Victims S / E / M % | Heavily shared victims % | Departure from LRU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lru | 1 | 272.64 | 2.3647 | 43,343 | 5,956,711 | 21.849 | 5,700,218 | 4,753,440 | 132,359 | 410,313 | 1,873,620 | 4.50 / 9.33 / 86.17 | 1.21 | – |
+| lru | 2 | 272.64 | 2.3673 | 43,296 | 5,970,232 | 21.898 | 5,714,081 | 4,770,601 | 132,349 | 408,111 | 1,870,814 | 4.49 / 9.26 / 86.25 | 1.19 | – |
+| rl-n4 | 1 | 272.64 | 2.3585 | 43,458 | 5,904,504 | 21.657 | 5,646,695 | 4,675,310 | 129,444 | 419,134 | 1,884,065 | 4.73 / 9.74 / 85.53 | 1.24 | 17.13% |
+| rl-n4 | 2 | 272.64 | 2.3586 | 43,457 | 5,892,376 | 21.613 | 5,635,073 | 4,661,067 | 129,764 | 419,027 | 1,882,540 | 4.75 / 9.76 / 85.49 | 1.24 | 16.64% |
+| rl-n4-frozen | 1 | 272.64 | 2.3679 | 43,286 | 5,829,641 | 21.382 | 5,584,694 | 4,559,444 | 110,805 | 459,057 | 1,867,394 | 5.84 / 10.04 / 84.11 | 1.46 | 15.44% |
+| rl-n4-frozen | 2 | 272.64 | 2.3624 | 43,387 | 5,814,532 | 21.327 | 5,570,072 | 4,535,475 | 109,905 | 464,437 | 1,875,314 | 5.98 / 10.17 / 83.85 | 1.48 | 15.69% |
+| rl-n4-prio | 1 | 272.64 | 2.3554 | 43,515 | 5,825,038 | 21.365 | 5,579,376 | 4,541,995 | 110,518 | 464,255 | 1,881,678 | 5.96 / 10.20 / 83.84 | 1.48 | 15.72% |
+| rl-n4-prio | 2 | 272.64 | 2.3617 | 43,400 | 5,835,232 | 21.403 | 5,588,575 | 4,559,170 | 110,661 | 460,231 | 1,874,866 | 5.85 / 10.08 / 84.07 | 1.47 | 15.48% |
+| rl-n4-rand | 1 | 272.64 | 2.3597 | 43,436 | 5,937,516 | 21.778 | 5,679,863 | 4,728,224 | 133,498 | 412,050 | 1,877,014 | 4.49 / 9.43 / 86.08 | 1.21 | 8.29% |
+| rl-n4-rand | 2 | 272.64 | 2.3635 | 43,366 | 5,941,267 | 21.792 | 5,683,757 | 4,729,515 | 134,071 | 413,487 | 1,879,986 | 4.48 / 9.51 / 86.02 | 1.22 | 8.29% |
+
+**DRAM:** reads are 1,547,418-1,559,236 and writes 1,223,791-1,230,191 for every run (within −0.2% to +0.6% of
+LRU's mean).
+
+**Policy diagnostics, per repetition:**
+
+| Policy | Rep | History returns (MPKI) | Rewards: evict-bad / evict-good / protect-good / protect-wasted % | Protections contradicted | Max passes | All candidates tied | Victim at LRU position 0 / 1 / 2 / 3 % |
+|---|---|---|---|---|---|---|---|
+| rl-n4 | 1 | 9.655 | 41.7 / 44.4 / 2.7 / 11.2 | 41.1% | 111 | 70.8% | 82.9 / 7.2 / 3.8 / 6.1 |
+| rl-n4 | 2 | 9.595 | 41.4 / 44.4 / 2.8 / 11.4 | 41.4% | 55 | 71.6% | 83.4 / 6.8 / 3.7 / 6.2 |
+| rl-n4-frozen | 1 | 9.460 | 38.1 / 41.5 / 5.1 / 15.4 | 35.2% | 328 | 84.1% | 84.6 / 0.8 / 2.0 / 12.6 |
+| rl-n4-frozen | 2 | 9.420 | 38.0 / 41.5 / 4.9 / 15.6 | 36.1% | 320 | 83.8% | 84.3 / 0.9 / 2.1 / 12.7 |
+| rl-n4-prio | 1 | 9.446 | 38.0 / 41.4 / 4.9 / 15.7 | 34.8% | 382 | 83.8% | 84.3 / 0.8 / 2.0 / 12.8 |
+| rl-n4-prio | 2 | 9.474 | 38.2 / 41.5 / 4.9 / 15.5 | 35.7% | 198 | 84.1% | 84.5 / 0.8 / 2.1 / 12.6 |
+| rl-n4-rand | 1 | 9.704 | 42.1 / 44.8 / 1.7 / 11.4 | 43.2% | 7 | 100.0% | 91.7 / 2.8 / 2.8 / 2.8 |
+| rl-n4-rand | 2 | 9.718 | 42.1 / 44.8 / 1.7 / 11.4 | 43.1% | 8 | 100.0% | 91.7 / 2.8 / 2.8 / 2.8 |
+
+* As on LU, the controls count every reward but apply none. Their reward columns describe their decisions' outcomes
+  in rl-n4's terms. For `rl-n4-rand`, "all tied" is 100% by definition.
+* **rl-n4's weights** oscillate as in the pilot. Each feature's sign changes in 16-23% of the weight snapshots;
+  the second-half means are +0.05 to +0.28 for every feature, on every core.
+
+**Means, change vs LRU** (two repetitions each):
+
+| | rl-n4 | rl-n4-frozen | rl-n4-prio | rl-n4-rand |
+|---|---|---|---|---|
+| L2 misses | −1.09% | −2.37% | −2.24% | −0.40% |
+| L2 demand misses | −1.16% | −2.27% | −2.16% | −0.44% |
+| L2 dirty evictions | −1.97% | −4.51% | −4.44% | −0.70% |
+| L2 invalidations | −2.08% | −16.62% | −16.44% | +1.08% |
+| L2 downgrades | +2.41% | +12.84% | +12.96% | +0.87% |
+| L3 misses | +0.59% | −0.05% | +0.32% | +0.34% |
+| Simulated time | +0.32% | +0.04% | +0.32% | +0.19% |
+| IPC | −0.32% | −0.04% | −0.32% | −0.19% |
+| Departure from LRU | 16.9% | 15.6% | 15.6% | 8.3% |
+
+**Variability and the earlier baseline:**
+* **Pilot 3's Ocean runs** (validated binary `192619ee…`, 5 runs at a time) agree with these:
+  * **LRU:** 5,945,424 and 5,951,640 L2 misses; all four LRU runs span 5,945,424-5,970,232 (0.42%).
+  * **rl-n4:** 5,906,796 and 5,889,034; all four rl-n4 runs span 5,889,034-5,906,796. Its change vs LRU was
+    −0.85% in the pilot and −1.09% here.
+  * **Time:** the four LRU runs span 43,296-43,416 µs (0.28%). rl-n4's time vs its own batch's LRU was −0.04% in
+    the pilot and +0.32% here.
+* **Each policy's own two runs** differ by 0.06-0.26% in L2 misses.
+* **The order of L2 misses** is lru > rand > rl-n4 > {prio, frozen} in both repetitions.
+  * Frozen and priority swap places between repetitions.
+  * Both frozen and both priority runs are below all four LRU runs and all four rl-n4 runs, pilot included. The
+    gap from rl-n4 (about 54-92 k misses) is several times the largest within-policy spread (about 15 k).
+
+**Cache effects versus run time:**
+* **Cache level:** every state-aware policy (rl-n4, frozen, priority) has fewer L2 misses and dirty evictions than
+  LRU in both repetitions.
+* **Run time: no improvement.** Simulated time is within −0.08% to +0.45% of LRU's mean for every run, against
+  LRU's own 0.28% range across four runs.
+* **Why:** L3 misses and DRAM traffic stay within −0.2% to +0.6% of LRU for every policy. The saved L2 misses
+  became L3 hits, and the DRAM traffic that makes Ocean memory-bound did not change.
+
+**The coherence tradeoff of frozen and priority.** Relative to LRU's mean, per run:
+* **Invalidations:** −16.5% (about −22 k).
+* **Downgrades:** +12.9% (about +53 k).
+* **Victims:** more S (5.9% vs 4.5%) and E victims, fewer M (84.0% vs 86.2%).
+* **Plausible mechanism (not verified):** evicting S and E blocks before M ones keeps fewer S copies around to be
+  invalidated, and keeps more owned blocks resident to be downgraded when another core reads them.
+* **Net cost:** this timing model gives no separate cost for either event. Coherence write-backs change by only
+  0-2 k, and simulated time did not move. Whether the exchange is favourable on other hardware or workloads is
+  not known. Fewer invalidations should therefore not be read as an unqualified coherence improvement.
+
+**What the comparison shows:**
+* **Frozen and priority did better than online rl-n4 in both repetitions:** about twice rl-n4's L2-miss reduction
+  (−2.4% and −2.2% against −1.1%).
+  * **Departure rates:** slightly lower than rl-n4's (15.6% against 16.9%). The difference is in which candidate is
+    chosen, not how often LRU is overridden.
+  * **Out of sample:** both settings come from LU, so this is a transfer result, which the LU ablation could not
+    give.
+* **The random control did worse than rl-n4 here:** −0.40% against −1.09%. It departed from LRU at half rl-n4's
+  rate (8.3% against 16.9%), because its rate was set for LU and not retuned. The two are therefore not matched,
+  and this comparison does not establish that random departures at rl-n4's rate would do worse.
+* **Online learning did not outperform the fixed no-learning settings in this experiment.**
+  * **Not general:** two workloads and one configuration cannot show that online learning is ineffective in
+    general.
+  * **Not significant:** no difference here is statistically established.
+  * **Run time:** no policy improved execution performance.
+
+**Misses saved per departure: descriptive only.** Relative to LRU's mean, L2 misses saved per 1,000 departures were:
+
+| rl-n4-rand | rl-n4 | rl-n4-prio | rl-n4-frozen |
+|---|---|---|---|
+| 49-57 | 63-78 | 153-163 | 160-175 |
+
+These ratios do not give a controlled, causal comparison of decision quality:
+* **The rates differ:** a policy that departs more often also changes the cache contents more and changes which
+  later decisions arise. The benefit per departure need not stay constant as the rate changes.
+* **Each saving is a whole-run difference from LRU,** not a per-decision measurement. LRU's own two runs differ by
+  about 13.5 k misses.
+* **Only random can be matched to rl-n4's rate.** That needs a new run at `random_rate` ≈ 0.17, which was not done.
+
+**Ocean compared with LU `tiny`:**
+
+| | LU `tiny` (exploratory) | Ocean `small` (validated) |
+|---|---|---|
+| Frozen and priority vs rl-n4, L2 misses | better in both repetitions (priority −5.0%, frozen −1.5% relative to rl-n4) | better in both repetitions (−1.3% and −1.2% relative to rl-n4) |
+| Frozen vs priority | priority clearly better (−8.1% vs −4.7% vs LRU) | the same within noise (−2.2% vs −2.4%) |
+| Random vs rl-n4 | about the same (−4.8% vs −3.2%) at a matched rate (8.2-8.7% for all) | worse (−0.4% vs −1.1%) at half rl-n4's rate (8.3% vs 16.9%) |
+| Departure rate of the state-aware policies | 8.2-8.7% | 15.4-17.1% |
+| Invalidations vs LRU | state-aware −4.6% to −6.7%, random −1.2% | frozen and priority about −16.5%, rl-n4 −2.1%, random +1.1% |
+| Downgrades vs LRU | −1.8% to +1.1% | frozen and priority about +13%, rl-n4 +2.4% |
+| Rewards: evict-bad / evict-good % (rl-n4) | about 80 / 7 | about 42 / 44 |
+| Victims S / heavily shared % (LRU) | about 9.4 / 5.1 | about 4.5 / 1.2 |
+| L3 misses | compulsory only (33.4 k) | 1.87 M, unchanged by every policy |
+| Simulated time | within −0.14% to +0.04% of LRU | within −0.08% to +0.45% of LRU |
+
+* **Agreement:**
+  * Both fixed settings beat online rl-n4 on cache misses in every repetition on both workloads.
+  * No policy changes run time.
+  * The controls behave as specified.
+* **Differences:**
+  * **Random:** on LU it matched rl-n4 at the same rate; on Ocean it did worse at half the rate.
+  * **The two fixed settings:** on LU priority clearly beats the frozen vector; on Ocean they are
+    indistinguishable.
+  * **Coherence:** on Ocean frozen and priority trade invalidations for downgrades at a much larger scale.
+  * **Rewards:** the composition of rl-n4's rewards differs completely between the two workloads.
+* **Why frozen and priority converge on Ocean:** only about 1.2-1.5% of Ocean's victims carry a heavy sharer hint,
+  and about 96-97% have a hint of 1. With the sharing feature almost always "below threshold", both settings reduce
+  to the same order, S before E before M. Their victim positions are nearly identical (12.6-12.8% at the 4th
+  oldest).
+  * **What Ocean tests:** the MESI-state preference, and next to nothing of the sharing feature.
+  * **What it does not show:** that sharing information is unhelpful. It shows only that this workload gives that
+    feature almost nothing to discriminate.
+
+**Limitations:**
+* **Sampling:**
+  * two repetitions per policy; live 4-core runs are not repeatable;
+  * one configuration (8 MB L3, 4 cores, policy on the L2 only);
+  * two workloads, one of them exploratory.
+* **Random control:** a single seed and a rate not matched to rl-n4's on Ocean.
+* **Frozen vector and priority rule:** both derived from LU, so they are independent of Ocean but not of the
+  overall investigation.
+
+**Archive:** `results/archive/stage6-ocean-ablation-20261122.tar.gz` (sha256 `b77e1c7a…3e1b`, in the `.sha256`
+file beside it). It holds:
+* the run directories, manifest, checker output, summary and both CSVs;
+* the analysis and its script (`analysis-scripts/ocean_ablation.py`), with the pilot's Ocean runs extracted as
+  `pilot-ocean-per-run.csv`;
+* `PROVENANCE.txt`, `READOUT.txt`, the command and the progress log.
+
+The binary verification is in `results/archive/stage6-rebuild-verification-20261122.tar.gz`.

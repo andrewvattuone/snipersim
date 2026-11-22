@@ -449,8 +449,9 @@ every 1,000 decisions). Five weights are learned: S, E, M, below threshold (BT) 
   is LRU. Its effects are small: −0.7 to −0.85% L2 misses on Ocean, nothing separable on Barnes.
 * **No result here is demonstrably caused by learning.** The difference from LRU could come from a fixed priority
   within the N-candidate window. It could also come from any non-LRU perturbation.
-* **The controls needed were not run in these pilots** (they have since been implemented and run on LU `tiny`:
-  [`CAPBENCH.md`](CAPBENCH.md), "LU `tiny` no-learning ablation"). `rl/alpha=0` with the
+* **The controls needed were not run in these pilots.** They have since been implemented and run on LU `tiny` and
+  on Ocean `small`: [`CAPBENCH.md`](CAPBENCH.md), "LU `tiny` no-learning ablation" and "Ocean `small` no-learning
+  comparison". `rl/alpha=0` with the
   zero initial weights is exactly LRU, so it is not a no-learning control. Candidate controls:
   1. frozen weights, for example the second-half means above, with no updates;
   2. a fixed state or sharer priority within the same window;
@@ -518,5 +519,10 @@ before any 1 MB L3 runs.
   [`CAPBENCH.md`](CAPBENCH.md).
 * **Not planned:** more repetitions of the Ocean/Barnes matrix. The differences are at the noise level and
   are limited by what the workloads expose, not by the number of samples.
-* **Needed before any claim about learning:** the no-learning controls listed in Pilot 3. They are now implemented
-  for review, and the CAP Bench LU `tiny` pilot that motivated them is in [`CAPBENCH.md`](CAPBENCH.md).
+* **Needed before any claim about learning:** the no-learning controls listed in Pilot 3. They are now implemented,
+  and the CAP Bench LU `tiny` pilot that motivated them is in [`CAPBENCH.md`](CAPBENCH.md).
+* **Controls run:** on LU `tiny` and on Ocean `small`, with the same settings (two repetitions each; [`CAPBENCH.md`](CAPBENCH.md),
+  "Ocean `small` no-learning comparison", which also compares the two).
+  * **Result:** on both workloads the frozen LU-derived weights and the fixed priority reduced L2 misses more than
+    online rl-n4 in every repetition.
+  * **Caveats:** two repetitions, no run-time change, and not a general verdict on learning.
