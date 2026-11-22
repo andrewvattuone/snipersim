@@ -449,7 +449,8 @@ every 1,000 decisions). Five weights are learned: S, E, M, below threshold (BT) 
   is LRU. Its effects are small: −0.7 to −0.85% L2 misses on Ocean, nothing separable on Barnes.
 * **No result here is demonstrably caused by learning.** The difference from LRU could come from a fixed priority
   within the N-candidate window. It could also come from any non-LRU perturbation.
-* **The controls needed are not yet run, and none exists as a configuration option today.** `rl/alpha=0` with the
+* **The controls needed were not run in these pilots** (they have since been implemented and run on LU `tiny`:
+  [`CAPBENCH.md`](CAPBENCH.md), "LU `tiny` no-learning ablation"). `rl/alpha=0` with the
   zero initial weights is exactly LRU, so it is not a no-learning control. Candidate controls:
   1. frozen weights, for example the second-half means above, with no updates;
   2. a fixed state or sharer priority within the same window;
