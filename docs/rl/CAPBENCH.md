@@ -501,8 +501,9 @@ the victim is chosen among the 4 oldest eligible candidates. Implementation, tes
   learning.
 * **Randomized:**
   * **Rate:** the probability equals rl-n4's measured rate of departing from LRU (8.3%). The run reports its own
-    actual rate (`rl-chose-other` / `rl-decisions`), which is slightly lower: with a single eligible candidate,
-    nothing is drawn.
+    actual rate (`rl-chose-other` / `rl-decisions`). A miss with fewer than two eligible candidates is not a
+    decision and is not counted, so the expected rate among counted decisions is exactly 0.083; the realised rate
+    differs from it only by sampling.
   * **What it controls for:** a non-LRU perturbation at the same rate but uninformed by MESI state or sharing.
     It does not mimic *where* rl-n4's departures happen.
 * **Status:** implemented and tested, not yet run on LU `tiny`.

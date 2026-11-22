@@ -395,8 +395,9 @@ defaults leave the algorithm unchanged.
   * **Seeds:** each cache's stream is `splitmix64(seed ^ core_id << 32)`, printed at start-up.
   * **Reproducibility:** a deterministic replay repeats every decision. In a live multi-threaded run, which block
     the k-th decision concerns varies from run to run, as for every policy.
-  * **Rate:** the realised departure rate is `rl-chose-other / rl-decisions`. It is slightly below `random_rate`
-    when a set has fewer than two eligible candidates, because nothing is drawn then.
+  * **Rate:** the realised departure rate is `rl-chose-other / rl-decisions`. A miss with fewer than two eligible
+    candidates evicts the only one without a draw and is not counted as a decision, so the expected rate among
+    counted decisions equals `random_rate`; the realised rate differs from it only by sampling.
 * **Start-up line:** a cache using any of these options prints a second line,
   `[RL] L2 core 0: rl_lru CONTROL selection=... learning=... random_rate=... seed=... (stream ...) initial weights ...`.
   Default runs print exactly what they printed before.
