@@ -4,8 +4,8 @@ Pilot experiments for Stage 6 of [`ALGORITHM_AUDIT.md`](ALGORITHM_AUDIT.md) (Sec
 `feature/rl-port` (`9bcf5e45`: the RL policies plus the trace front-end fix `fa8d21b6`). They are bounded pilots for
 review, not the benchmark campaign. The RL algorithms and their default parameters are unchanged.
 
-**Status: pilot findings only.** Every policy result below comes from **two repetitions** of one configuration
-(8 MB L3). The repetitions bound the run-to-run variation of the simulator, but two samples give no confidence
+**Status: pilot findings only.** Every policy result below, including Pilot 3 (Ocean/Barnes), comes from **two
+repetitions** of one configuration (8 MB L3). The repetitions bound the run-to-run variation of the simulator, but two samples give no confidence
 interval and cover no input or configuration variation. None of the differences is a statistically established
 performance improvement, and none is attributed to learning.
 
@@ -82,9 +82,12 @@ trace prefix.
   run's `sim.info` is not reliable: it is a CMake configure-time label (`build/default/config/sniper.py`), still
   `12eda347` from Stage 4 although the binary was rebuilt from `9bcf5e45`.
 
-Results are in the git-ignored `results/stage6-pilot/` and `results/stage6-fft-pilot/` (each with a
-`PROVENANCE.txt`; made read-only) and in `results/archive/stage6-pilots-20261121.tar.gz` (SHA-256 in the `.sha256`
-file beside it).
+Results are in the git-ignored `results/stage6-pilot/`, `results/stage6-fft-pilot/`, `results/stage6-splash2-qual/`
+and `results/stage6-ocean-barnes-pilot/`. Each has a `PROVENANCE.txt` and is read-only. Archives are in
+`results/archive/`, with the SHA-256 of each in the `.sha256` file beside it:
+* `stage6-pilots-20261121.tar.gz`, for the first two;
+* `stage6-splash2-qual-20261121.tar.gz`;
+* `stage6-ocean-barnes-pilot-20261121.tar.gz`.
 
 ## Pilot 1: `sharetest` (20 runs)
 
@@ -270,7 +273,213 @@ stale write hits.
   * Radix at `small` fits the L3, and its L2 hits are mostly near MRU.
   * They are a cheap sanity workload (Radix: 170 s) rather than a discriminator.
 
-## Recommendations
+## Pilot 3: Ocean `small` and Barnes 4,096 (20 runs)
+
+**Every policy comparison in this section is a preliminary two-repetition result.** The figures are means of two
+runs. "Spread" is (max − min) / mean over the two runs. Even a difference larger than the spread is not a
+statistically established effect.
+
+**Method.** The five policies above × `ocean-small` and `barnes-4096` (both `--roi`) × 2 repetitions, 8 MB L3,
+with the fixed configuration of the Method section. Five simulations ran in parallel, with timeouts of 3,000 s
+(Ocean) and 2,400 s (Barnes).
+* **Command:** `run_stage6.py results/stage6-ocean-barnes-pilot --workloads ocean-small,barnes-4096 --policies
+  lru,sf-text,sf-example,rl-n2,rl-n4 --reps 2 --jobs 5`.
+* **When:** 2026-11-21, 14:20-15:59 (1 h 39 min).
+* **Simulator:** `feature/rl-port` at `7a871fd7`, with a clean tree. This is the tooling commit; the simulator
+  sources are those of `9bcf5e45`, and the binary md5 is `192619ee…`, the same as in the earlier pilots.
+* **Analysis:** metrics from `summarize_stage6.py` (exit 0: the 20 runs share one commit and one binary, and
+  within each workload their `sim.cfg` differ only in the policy keys). The additional diagnostics below come
+  from the same `sim.stats` and from the RL weight snapshots in each run's `telemetry/` directory.
+
+**Completion and correctness:**
+* **Runs:** all 20 are `ok`: exit 0, no timeout, no crash, models enabled and disabled once at the ROI markers.
+* **Checks:** all 56 applicable checker verdicts are `PASS`. There are 0 stale write hits and no-eligible-victim
+  is 0.
+* **Wall time per run:** Ocean 1,475-1,624 s and Barnes 1,291-1,481 s.
+* **Shutdown message:** 7 of the 20 runs, LRU among them, log "channel to the simulator lost" from worker-thread
+  SIFT streams. It appears after the ROI and after the program's own final output, as in the qualification run.
+
+**Results** (ROI, all 4 cores; change against LRU; spread in parentheses):
+
+| Ocean | IPC | L2 MPKI | L2 dirty evictions | L2 coherence invalidations | L2 downgrades | L3 misses | DRAM reads / writes |
+|---|---|---|---|---|---|---|---|
+| LRU | 2.363 (0.20%) | 21.82 (0.10%) | 4.74 M | 133 k | 409 k | 1.875 M | 1.555 M / 1.227 M |
+| sf text | +0.22% | +11.4% | +15.5% | −2.1% | −11.5% | +0.07% | −0.14% / −0.09% |
+| sf example | 0.00% | +17.9% | +22.0% | −5.4% | +3.4% | −0.14% | −0.43% / +0.02% |
+| rl N=2 | −0.03% | −0.70% | −1.0% | −1.2% | −0.6% | +0.13% | +0.09% / −0.01% |
+| rl N=4 | +0.04% | −0.85% | −1.4% | −2.1% | +2.5% | −0.01% | −0.19% / +0.12% |
+
+| Barnes | IPC | L2 MPKI | L2 dirty evictions | L2 coherence invalidations | L2 downgrades | L3 misses | DRAM reads / writes |
+|---|---|---|---|---|---|---|---|
+| LRU | 5.088 (0.06%) | 0.525 (1.1%) | 38.9 k | 48.2 k | 111 k | 9.9 k | 8.4 k / 0 |
+| sf text | −0.10% | +4.0% | +18.9% | −3.8% | −0.6% | −0.3% | −0.1% / 0 |
+| sf example | −0.06% | +5.6% | +26.5% | −4.4% | +1.0% | −0.7% | −0.2% / 0 |
+| rl N=2 | +0.02% | −0.13% | −2.1% | +0.2% | +0.5% | −0.9% | −0.7% / 0 |
+| rl N=4 | −0.07% | +1.0% | −2.1% | +1.9% | +2.2% | −0.6% | −0.8% / 0 |
+
+**Per-repetition values:**
+
+| | Ocean IPC | Ocean L2 MPKI | Barnes IPC |
+|---|---|---|---|
+| LRU | 2.3608 / 2.3656 | 21.81 / 21.83 | 5.0861 / 5.0890 |
+| sf text | 2.3677 / 2.3690 | 24.32 / 24.30 | 5.0790 / 5.0864 |
+| sf example | 2.3620 / 2.3645 | 25.69 / 25.78 | 5.0857 / 5.0837 |
+| rl N=2 | 2.3624 / 2.3623 | 21.70 / 21.63 | 5.0924 / 5.0846 |
+| rl N=4 | 2.3633 / 2.3651 | 21.67 / 21.60 | 5.0905 / 5.0771 |
+
+**Other measurements:**
+* **Simulated time** mirrors IPC: same magnitude, opposite sign.
+* **L1-D MPKI:** unchanged in Ocean, 40.5 for every policy. In Barnes it is 1.3-3.7% lower than LRU under every
+  policy. The L1-D always uses LRU, and LRU's own two runs differ by 1.9% (7.71 / 7.56), so this is not analysed
+  further.
+* **Run-to-run variation:** the simulator is not deterministic between runs, LRU included. IPC spreads are
+  0.01-0.26%, and L2 miss spreads 0.1-2%.
+
+**What the comparisons show**, with two repetitions each:
+* **IPC:**
+  * No policy is separated from LRU on Barnes; every difference is within ±0.1%.
+  * On Ocean, both `sf-text` runs exceed both LRU runs (+0.22%), but LRU's own two runs differ by 0.20%.
+* **L2 misses:**
+  * `rl_lru` is lower than LRU on Ocean in both repetitions (−0.70% for N=2, −0.85% for N=4), with no IPC change.
+  * `sf_lru` raises L2 misses on both workloads: +11-18% on Ocean, +4-6% on Barnes.
+* **IPC barely follows the L2.** On Ocean, `sf-example`'s 18% more L2 misses leave IPC unchanged. The extra misses
+  are L3 hits: L3 loads rise by 1.06 M while L3 misses fall 0.14%. Why their latency does not show in IPC has not
+  been determined. Find out before IPC is used as the main metric for Ocean.
+
+**L3 and DRAM, corrected interpretation.** A first reading of these results said the 8 MB L3 holds both working
+sets. That is wrong for Ocean, as the qualification section already showed.
+* **Ocean overflows the L3.** With LRU in the ROI:
+  * L3: 5.95 M accesses and 1.875 M misses (32%; 0.54 M load misses and 1.33 M store misses).
+  * L3 evictions: 1.42 M (1.23 M modified and 0.20 M exclusive).
+  * DRAM: 1.555 M reads and 1.228 M writes. The writes equal the L3's modified evictions.
+  * DRAM reads are 0.32 M fewer than L3 misses; that difference was not analysed.
+* **Correct statement:** the L3 and DRAM traffic is large, but almost the same under every L2 policy (within
+  ±0.5%). The policy changes which blocks miss in the L2 and how many L2-L3 transfers occur, but not which blocks
+  the L3 holds and evicts.
+* **Barnes does fit:** 9.9 k L3 misses (cold), no L3 evictions and no DRAM writes in the ROI.
+
+**What the policies see:**
+* **Victim states and sharer hints:**
+  * **Ocean:** victims are 5% S, 9% E and 86% M. 97% have a delivered sharer hint of 1 and about 1% a heavy hint
+    (> 2 of 4 cores). The delivered hint equals the oracle count for 98% of victims.
+  * **Barnes:** victims are 54% S, 1% E and 45% M.
+    * Delivered hints: 66% 1, 22% 2, 7% 3 and 4% 4+. 10.8% are heavy under LRU (8-12% across policies).
+    * The delivered hint equals the oracle count for 66-71% of victims; otherwise it is lower.
+  * **Policy shifts:** the policies change these mixes by only a few points.
+* **Decisions:**
+
+  | | Ocean decisions | Ocean differs from LRU | Barnes decisions | Barnes differs from LRU |
+  |---|---|---|---|---|
+  | sf text | 6.17 M | 84% | 97 k | 85% |
+  | sf example | 6.56 M | 100% | 101 k | 99% |
+  | rl N=2 | 5.47 M | 14% | 86 k | 29% |
+  | rl N=4 | 5.46 M | 17% | 86 k | 45% |
+
+  * **Barnes is thin:** about 21,000 decisions per core over 512 sets, about 42 per set over the whole ROI.
+* **Feature variation:** the share of decisions in which every candidate has the same score.
+  * **Ocean:** 80% for `rl-n2` and 71% for `rl-n4`.
+  * **Barnes:** 47% (N=2) and 20% (N=4).
+  * With equal scores, `rl_lru` keeps the base choice, the LRU block.
+* **Protection outcomes:**
+  * **Wasted protections**, as a share of resolved protect rewards:
+    * `rl-n2`: 85% on Ocean and 74% on Barnes;
+    * `rl-n4`: 80% on Ocean and 63% on Barnes.
+  * **Contradicted wasted protections:** 40-42% (Ocean) and 70-73% (Barnes) of the protect-wasted rewards are
+    contradicted later by the block's return (I-6).
+  * **`sf_lru` protection runs:**
+    * Runs ending with the protected block invalidated: 20% (text) and 35% (example) on Ocean, 16% and 34% on
+      Barnes, against 72% in FFT.
+    * Runs of 5 or more consecutive rejections: 45% and 82% on Ocean, 19% and 35% on Barnes.
+  * **`rl_lru` pass runs:** up to 100 consecutive passes (Ocean, N=2), but only 1-6% of runs reach 5 passes.
+
+**Reward denominators** (repetition 1 of `rl-n2`, summed over the four L2s, ROI deltas; repetition 2 and N=4 are
+within a few percent). Each L2 keeps a 16-entry eviction history per set.
+* **Bad eviction (−1):** a demand miss on a block whose entry is still in its set's history.
+* **Good eviction (+1):** an entry pushed out of a full history (aged out) without returning.
+* **Upgrade refills** are not policy misses. Neither are invalidations, which create no history entry.
+
+| | Barnes | Ocean |
+|---|---|---|
+| Replacement evictions = history inserts = decisions | 85,055 | 5,475,890 |
+| Bad evictions (returned while in the history) | 67,087 (78.9% of inserts) | 2,635,893 (48.1%) |
+| Good evictions (aged out) | 1,612 (1.9% of inserts) | 2,807,229 (51.3%) |
+| Inserts − bad − good (unresolved at the ROI end, net of entries carried in from the warm-up) | 16,356 (19.2%) | 32,768 (0.6%) |
+| Policy demand misses (L2 misses minus upgrade refills) | 147,674 | 5,659,870 |
+| of which in the history (= bad evictions) | 45.4% | 46.6% |
+| of which replaced and no longer in the history (aged out, then reused) | 112 (0.1%) | 2,609,198 (46.1%) |
+| of which cold / coherence-invalidated | 24.5% / 30.0% | 4.5% / 2.9% |
+
+* **Barnes's "98% bad"** is 67,087 / (67,087 + 1,612). Its denominator is the resolved eviction rewards only,
+  not all evictions or all rewards.
+  * As a share of all evictions, bad is 79%: the same event as the "79% eviction-history reuse", whose
+    denominator is history inserts.
+  * As a share of all 85,197 rewards (with 4,270 protect-good and 12,228 protect-wasted), it is 78.7%.
+* **Why good rewards are rare in Barnes.** A good reward needs a set to receive 16 more evictions before the
+  block returns. With about 42 evictions per set in the whole ROI, histories seldom fill, and almost every evicted
+  block (all but 112) that returns does so within the history. Nearly every possible victim earns −1, so the
+  reward says little about which candidate was the better choice.
+* **Ocean's good rewards are mostly contradicted later.** 2.61 M misses are on blocks that had already aged out
+  of the history. That is 93% of the 2.81 M good rewards; the two counts do not pair one-to-one at the ROI
+  boundaries. Ocean's reuse distance exceeds the 16-entry history, so "aged out" usually does not mean "not
+  needed".
+
+**Weights** (`rl_lru`, one weight vector per L2: `weight_scope=global` shares it across sets, not cores; snapshot
+every 1,000 decisions). Five weights are learned: S, E, M, below threshold (BT) and above threshold (AT).
+* **Ocean** has about 1,360 snapshots per core.
+  * **They change often.** Each weight changes sign on 14-23% of snapshot intervals, i.e. about every 5-7
+    snapshots, and moves over most of [−1, 1].
+  * **But their averages repeat.** The second-half means are positive and agree across the 4 cores and both
+    repetitions: wE +0.25-0.37, wS +0.13-0.26, and wM, wBT, wAT +0.08-0.20. E and S blocks are therefore, on
+    average, the preferred victims over M.
+  * So the weights are not a random walk. They fluctuate strongly around a reproducible tendency.
+* **Barnes** has only 16-27 snapshots per core.
+  * Weights are mostly negative: positive in 6-44% of snapshots, second-half means −0.25 to −0.81.
+  * Core 0's wE is positive (+0.55-0.75) in all four runs.
+* **Not shown:** whether these weights, or their updating, choose better victims than a fixed rule.
+
+**Effects of the selection rule versus effects of learning:**
+* **`sf_lru` (both rules)** has no learned parameters. Each decision is a fixed rule applied to the history's
+  class counts (text) or to the block's own class (example). All its effects are therefore effects of its
+  victim-selection rule:
+  * more L2 misses and dirty evictions;
+  * fewer coherence invalidations;
+  * `sf-text`'s 11.5% fewer Ocean downgrades with +0.22% IPC. The plausible mechanism is that it evicts M blocks
+    earlier, so their write-back precedes the neighbour's read. Not verified.
+* **`rl_lru`'s** non-LRU choices (14-45% of decisions) come from its weights: with the initial all-zero weights it
+  is LRU. Its effects are small: −0.7 to −0.85% L2 misses on Ocean, nothing separable on Barnes.
+* **No result here is demonstrably caused by learning.** The difference from LRU could come from a fixed priority
+  within the N-candidate window. It could also come from any non-LRU perturbation.
+* **The controls needed are not yet run, and none exists as a configuration option today.** `rl/alpha=0` with the
+  zero initial weights is exactly LRU, so it is not a no-learning control. Candidate controls:
+  1. frozen weights, for example the second-half means above, with no updates;
+  2. a fixed state or sharer priority within the same window;
+  3. a random choice within the window at the same rate of differing from LRU.
+
+  Each needs a small, separately reviewed simulator option; this would not change the RL algorithm itself.
+* **Frequent sign changes and wasted or contradicted protections** are evidence of possible weaknesses in the
+  reward and feature design, not proof of them.
+
+**Limitations:**
+* two repetitions;
+* one L3 size;
+* 4 cores, against the paper's 16;
+* policy on the L2 only;
+* a real (not perfect) L3;
+* a single input per program;
+* Barnes has too few decisions per set to train or judge the weights.
+
+**Results:**
+* **Run directories:** `results/stage6-ocean-barnes-pilot/` (git-ignored, read-only). It holds `manifest.jsonl`,
+  `checkers.txt`, `metrics.csv` and `PROVENANCE.txt`.
+* **Batch files:** `results/stage6-ocean-barnes-pilot.progress.log` and `.command`. The command file holds the HEAD
+  commit and the binary, workload and input md5s.
+* **Archive:** `results/archive/stage6-ocean-barnes-pilot-20261121.tar.gz`, with its SHA-256 in the `.sha256`
+  beside it.
+
+## Recommendations (written before Pilot 3)
+
+This section records the plan made after the qualification runs; Pilot 3 carried out its "next step". What
+follows Pilot 3 is in "After Pilot 3".
 
 **Next workloads:** Ocean and Barnes, in that order.
 * **Ocean `small`:** the only workload where L2 replacement can change performance.
@@ -300,3 +509,12 @@ before any 1 MB L3 runs.
   * **Other SPLASH-2:** Cholesky, FMM, Water and the non-contiguous variants build the same way (minutes).
   * **PARSEC 2.1:** canneal, streamcluster and others need the repository's PARSEC download (several GB) and
     `parsecmgmt`, which is also Python 2 driven.
+
+## After Pilot 3
+
+* **Next Stage 6 priority:** reproducing the paper's CAP Bench workloads (FAST, FN, GF, IS, KM, LU, TSP), before
+  Stage 7 or any change to the RL algorithm. The feasibility and qualification findings are reported separately
+  for review.
+* **Not planned:** more repetitions of the Ocean/Barnes matrix. The differences are at the noise level and
+  are limited by what the workloads expose, not by the number of samples.
+* **Needed before any claim about learning:** the no-learning controls listed in Pilot 3.
