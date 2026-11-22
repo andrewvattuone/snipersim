@@ -250,7 +250,8 @@ public:
     stats.pinned_short += runs_.count_at_least(set, kPinnedShort);
     stats.pinned_long += runs_.count_at_least(set, kPinnedLong);
 
-    // Scores of the window, as choose() computed them
+    // Scores of the window, as choose() computed them (selection_score: the weight score for the learned selection,
+    // the fixed rank for priority, 0 for random, whose candidates are therefore always all tied)
     const auto& cfg = p.config();
     const auto& w = p.weights(set);
     const auto window = std::clamp<std::size_t>(cfg.window, 1, candidates.size());
@@ -260,7 +261,7 @@ public:
     Features first{};
     for (std::size_t i = 0; i < window; ++i) {
       const Features f = info(candidates[i]);
-      const double v = w.score(cfg.mode, f);
+      const double v = p.selection_score(set, f);
       if (i == 0) {
         lo = hi = v;
         first = f;

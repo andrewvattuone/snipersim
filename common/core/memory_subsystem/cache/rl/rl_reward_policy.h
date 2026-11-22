@@ -15,6 +15,10 @@
  *     an option (default global, as ChampSim).
  * Details and the remaining differences: docs/rl/POLICY_CORES.md.
  *
+ * Experimental controls (Stage 6; off by default, and then every decision is the algorithm's): initial weights,
+ * learning off (frozen weights), and two other selection rules among the same N candidates, a fixed MESI/sharing
+ * priority and a seeded random departure from the oldest candidate (Selection, below).
+ *
  *   V(b) = wM*xM + wE*xE + wS*xS + wAT*xAT + wBT*xBT      (higher = more attractive to evict)
  *   w_i += alpha * (r - w_i)                              for the features active in the rewarded snapshot
  *
@@ -56,12 +60,89 @@ inline std::optional<WeightScope> parse_weight_scope(std::string_view s)
 }
 inline constexpr std::string_view name(WeightScope s) { return s == WeightScope::global ? "global" : "per_set"; }
 
+/*
+ * How the victim is chosen among the first N candidates. `learned` is the algorithm; the other two are experimental
+ * controls for the question "does learning add anything to a fixed preference?" (Stage 6, docs/rl/POLICY_CORES.md):
+ *   learned   highest weight score, ties to the older candidate                                     (default)
+ *   priority  highest fixed rank (priority_rank: S > E > M, then above > below the threshold), ties to the older
+ *             candidate; the weights are not used
+ *   random    the oldest candidate, or with probability random_rate one of the other N-1 drawn uniformly by a
+ *             seeded, reproducible draw (random_draw); the weights are not used
+ * Every rule sees the same candidates (the base policy's eligible ways, oldest first) and the same window, and keeps
+ * the same history, protection and reward bookkeeping, so the diagnostics stay comparable.
+ */
+enum class Selection { learned, priority, random };
+
+inline std::optional<Selection> parse_selection(std::string_view s)
+{
+  if (s == "learned")
+    return Selection::learned;
+  if (s == "priority")
+    return Selection::priority;
+  if (s == "random")
+    return Selection::random;
+  return std::nullopt;
+}
+inline constexpr std::string_view name(Selection s)
+{
+  return s == Selection::learned ? "learned" : s == Selection::priority ? "priority" : "random";
+}
+
+/*
+ * Fixed victim priority for Selection::priority (higher = evict first). State rank S 2, E 1, M 0 (I, no information,
+ * 1), doubled, plus 1 for a sharer count above the threshold, each part only if the mode uses that feature group.
+ * With mode both: S/above 5 > S/below 4 > E/above 3 > E/below 2 > M/above 1 > M/below 0. The order is a hypothesis
+ * (evict Shared and widely shared blocks before Modified ones), fixed in advance, not fitted to any run.
+ */
+inline int priority_rank(Mode m, Features f)
+{
+  int r = 0;
+  if (uses_state(m))
+    r += 2 * (f.state == Mesi::S ? 2 : f.state == Mesi::M ? 0 : 1);
+  if (uses_sharing(m) && f.above)
+    r += 1;
+  return r;
+}
+
+// SplitMix64 finaliser (Steele, Lea, Flood 2014): a fixed, portable bit mix, so random draws do not depend on the
+// standard library's generators or distributions.
+inline std::uint64_t splitmix64(std::uint64_t x)
+{
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+/*
+ * Selection::random's draw for decision number `decision` (0, 1, ... in commit order) of a policy with `seed`: a
+ * function of the two only, with no generator state, so the k-th decision always gets the same draw. A deterministic
+ * replay therefore repeats every decision; in a live multi-threaded run, which block the k-th decision concerns can
+ * still vary from run to run, as for every policy. Returns the index in the window to evict: 0 (the oldest) unless a
+ * uniform draw u in [0, 1) is below `rate`, then 1..window-1 uniformly (modulo bias below 2^-60 for a few ways).
+ */
+inline std::size_t random_draw(std::uint64_t seed, std::uint64_t decision, double rate, std::size_t window)
+{
+  if (window < 2)
+    return 0;
+  const std::uint64_t h = splitmix64(seed ^ splitmix64(decision));
+  const double u = static_cast<double>(h >> 11) * 0x1.0p-53;
+  if (!(u < rate))
+    return 0;
+  return 1 + static_cast<std::size_t>(splitmix64(h) % static_cast<std::uint64_t>(window - 1));
+}
+
 struct RewardConfig {
   Mode mode = Mode::both;
   std::uint32_t window = 4;     // N: how many of the base policy's first candidates are compared (>= 1)
   double alpha = 0.1;           // learning rate, in [0, 1]
   bool protect_feedback = true; // learn from passed-over (protected) blocks
   WeightScope scope = WeightScope::global;
+  // Experimental controls (defaults: the algorithm unchanged)
+  Selection selection = Selection::learned;
+  bool learning = true;      // false: rewards are still counted, but no weight ever changes (frozen weights)
+  double random_rate = 0.0;  // Selection::random: probability of not evicting the oldest candidate, in [0, 1]
+  std::uint64_t seed = 0;    // Selection::random: seed of the draws
 };
 
 /*
@@ -181,7 +262,11 @@ class RewardPolicy
   WeightTable& table(std::uint32_t set) { return weights_.at(cfg_.scope == WeightScope::global ? 0 : set); }
   LineMeta& line_(std::uint32_t set, std::uint32_t way) { return lines_.at(set).at(way); }
 
-  void reward(std::uint32_t set, Features f, double r) { table(set).reward(cfg_.mode, f, r, cfg_.alpha); }
+  void reward(std::uint32_t set, Features f, double r)
+  {
+    if (cfg_.learning)
+      table(set).reward(cfg_.mode, f, r, cfg_.alpha);
+  }
 
 public:
   RewardStats stats;
@@ -202,10 +287,28 @@ public:
   [[nodiscard]] const EvictionHistory& history(std::uint32_t set) const { return history_.at(set); }
 
   /*
+   * The value choose() maximises for a candidate with features `f` (Selection::learned: the weight score; priority:
+   * priority_rank; random: 0, every candidate alike). The diagnostics use it to count ties.
+   */
+  [[nodiscard]] double selection_score(std::uint32_t set, Features f) const
+  {
+    switch (cfg_.selection) {
+    case Selection::priority:
+      return static_cast<double>(priority_rank(cfg_.mode, f));
+    case Selection::random:
+      return 0.0;
+    case Selection::learned:
+    default:
+      return weights(set).score(cfg_.mode, f);
+    }
+  }
+
+  /*
    * Pick a victim without changing anything. `candidates` is the base policy's preference order (LRU: oldest first;
    * must not be empty); `info(way)` returns a candidate's current features. Among the first N candidates the highest
    * score wins; scanning in order with a strict comparison sends ties to the older candidate. With all weights equal
-   * (initially all 0) this is the base policy's choice.
+   * (initially all 0) this is the base policy's choice. Selection::random instead takes random_draw()'s index for
+   * this decision (the number of decisions committed so far).
    */
   template <typename Info>
   [[nodiscard]] RewardDecision choose(std::uint32_t set, const std::vector<std::uint32_t>& candidates, Info&& info) const
@@ -215,18 +318,21 @@ public:
     if (cfg_.mode != Mode::off && candidates.size() >= 2) {
       d.learned = true;
       const auto window = std::clamp<std::size_t>(cfg_.window, 1, candidates.size());
-      const auto& w = weights(set);
       std::vector<Features> f(window);
       for (std::size_t i = 0; i < window; ++i)
         f[i] = info(candidates[i]);
 
       std::size_t chosen = 0;
-      double best = w.score(cfg_.mode, f[0]);
-      for (std::size_t i = 1; i < window; ++i)
-        if (const double v = w.score(cfg_.mode, f[i]); v > best) {
-          best = v;
-          chosen = i;
-        }
+      if (cfg_.selection == Selection::random) {
+        chosen = random_draw(cfg_.seed, stats.decisions, cfg_.random_rate, window);
+      } else {
+        double best = selection_score(set, f[0]);
+        for (std::size_t i = 1; i < window; ++i)
+          if (const double v = selection_score(set, f[i]); v > best) {
+            best = v;
+            chosen = i;
+          }
+      }
       d.victim = candidates[chosen];
       for (std::size_t i = 0; i < chosen; ++i)
         d.passed_over.emplace_back(candidates[i], f[i]);

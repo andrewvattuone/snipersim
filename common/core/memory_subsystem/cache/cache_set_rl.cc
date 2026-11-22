@@ -101,10 +101,44 @@ CacheSetInfoRL::CacheSetInfoRL(String name, String cfgname, core_id_t core_id, U
       LOG_ASSERT_ERROR(c.alpha >= 0.0 && c.alpha <= 1.0, "%s/rl/alpha must be in [0, 1] (%f)", cfgname.c_str(), c.alpha);
       c.protect_feedback = Sim()->getCfg()->getBoolDefault(cfgname + "/rl/protect_feedback", true);
       c.scope = parseKey<rlrepl::WeightScope>(cfgname + "/rl/weight_scope", "global", rlrepl::parse_weight_scope);
-      m_reward.reset(new rlrepl::RewardPolicy(c, num_sets, associativity));
+
+      // Experimental controls (docs/rl/POLICY_CORES.md, "Controls for the learning question"); the defaults leave the
+      // algorithm unchanged. Initial weights are separate keys because a comma-separated value is a per-core list.
+      c.selection = parseKey<rlrepl::Selection>(cfgname + "/rl/selection", "learned", rlrepl::parse_selection);
+      c.learning = Sim()->getCfg()->getBoolDefault(cfgname + "/rl/learning", true);
+      c.random_rate = Sim()->getCfg()->getFloatDefault(cfgname + "/rl/random_rate", 0.0);
+      LOG_ASSERT_ERROR(c.random_rate >= 0.0 && c.random_rate <= 1.0, "%s/rl/random_rate must be in [0, 1] (%f)", cfgname.c_str(), c.random_rate);
+      LOG_ASSERT_ERROR(c.selection == rlrepl::Selection::random || c.random_rate == 0.0,
+                       "%s/rl/random_rate is only used with rl/selection=random", cfgname.c_str());
+      const SInt64 seed = Sim()->getCfg()->getIntDefault(cfgname + "/rl/seed", 0);
+      LOG_ASSERT_ERROR(seed >= 0, "%s/rl/seed must be >= 0 (%ld)", cfgname.c_str(), (long)seed);
+      // One reproducible stream per cache: the configured seed mixed with the core id
+      c.seed = rlrepl::splitmix64((std::uint64_t)seed ^ ((std::uint64_t)core_id << 32));
+      rlrepl::WeightTable initial;
+      const char *const weight_keys[5] = {"S", "E", "M", "BT", "AT"};
+      double w[5];
+      bool initial_set = false;
+      for (int i = 0; i < 5; ++i)
+      {
+         const String key = cfgname + "/rl/initial_weights/" + weight_keys[i];
+         initial_set |= Sim()->getCfg()->hasKey(key);
+         w[i] = Sim()->getCfg()->getFloatDefault(key, 0.0);
+         LOG_ASSERT_ERROR(w[i] >= -1.0 && w[i] <= 1.0, "%s must be in [-1, 1] (%f)", key.c_str(), w[i]);
+      }
+      initial.set_state_weight(rlrepl::Mesi::S, w[0]);
+      initial.set_state_weight(rlrepl::Mesi::E, w[1]);
+      initial.set_state_weight(rlrepl::Mesi::M, w[2]);
+      initial.set_share_weight(false, w[3]);
+      initial.set_share_weight(true, w[4]);
+
+      m_reward.reset(new rlrepl::RewardPolicy(c, num_sets, associativity, initial));
       printf("[RL] %s core %d: rl_lru mode=%s window=%u alpha=%g protect_feedback=%d weight_scope=%s history=%u/set threshold=>%u of %u cores\n",
              name.c_str(), core_id, std::string(rlrepl::name(c.mode)).c_str(), c.window, c.alpha, (int)c.protect_feedback,
              std::string(rlrepl::name(c.scope)).c_str(), 2 * associativity, m_num_cores / 2, m_num_cores);
+      if (c.selection != rlrepl::Selection::learned || !c.learning || initial_set)
+         printf("[RL] %s core %d: rl_lru CONTROL selection=%s learning=%d random_rate=%g seed=%ld (stream %016llx) initial weights S=%g E=%g M=%g BT=%g AT=%g\n",
+                name.c_str(), core_id, std::string(rlrepl::name(c.selection)).c_str(), (int)c.learning, c.random_rate, (long)seed,
+                (unsigned long long)c.seed, w[0], w[1], w[2], w[3], w[4]);
    }
    registerStats(name, core_id);
    setupDiagnostics(name, cfgname, core_id, associativity, num_sets);

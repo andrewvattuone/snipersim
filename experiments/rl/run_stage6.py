@@ -3,6 +3,7 @@
 
 Usage: run_stage6.py OUTDIR --workloads sharetest-r,sharetest-u --l3 8192 --reps 2 [--jobs 5] [--timeout SECONDS]
                      [--policies lru,sf-text,sf-example,rl-n2,rl-n4] [--dry-run]
+       (also lru-hist, and the controls rl-n4-frozen, rl-n4-prio, rl-n4-rand: see POLICIES)
 
 Every simulation gets the same explicit configuration apart from the policy keys: 4-core Gainestown, private L2 as
 the only cache with the policy under test, prefetchers off, traceinput/num_runs = 1, the given shared L3 size, and
@@ -73,6 +74,22 @@ POLICIES = {
     'lru-hist':   [f'{L2}/replacement_policy=rl_lru', f'{L2}/rl/mode=both', f'{L2}/rl/window=2', f'{L2}/rl/alpha=0',
                    f'{L2}/rl/protect_feedback=true', f'{L2}/rl/weight_scope=global'],
 }
+# Controls for the learning question (docs/rl/POLICY_CORES.md, "Controls for the learning question"; CAPBENCH.md):
+# rl-n4's window, candidates, history, protection and diagnostics, with no weight updates and another selection rule.
+RL_N4_BASE = POLICIES['rl-n4']
+# Frozen weights: the mean of the second-half in-ROI weight snapshots of the 12 core-runs of the LU tiny rl-n4 pilot
+# (results/stage6-capbench-lu-pilot), so an in-sample control for that workload, not an independent one.
+FROZEN_LU_TINY = {'S': -0.09, 'E': -0.38, 'M': -0.76, 'BT': -0.64, 'AT': 0.0}
+POLICIES.update({
+    'rl-n4-frozen': RL_N4_BASE + [f'{L2}/rl/learning=false']
+                    + [f'{L2}/rl/initial_weights/{k}={v}' for k, v in FROZEN_LU_TINY.items()],
+    # Fixed priority: S > E > M, then above > below the sharing threshold, ties to the older candidate (priority_rank)
+    'rl-n4-prio':   RL_N4_BASE + [f'{L2}/rl/learning=false', f'{L2}/rl/selection=priority'],
+    # Randomized: the oldest candidate, or with probability 0.083 (rl-n4's measured rate of leaving LRU on LU tiny)
+    # one of the other three, by a seeded per-cache draw
+    'rl-n4-rand':   RL_N4_BASE + [f'{L2}/rl/learning=false', f'{L2}/rl/selection=random', f'{L2}/rl/random_rate=0.083',
+                                  f'{L2}/rl/seed=1'],
+})
 # Workloads: name -> command after `--`, whether to simulate the ROI only, and an optional stdin file.
 # The SPLASH-2 arguments are those of the benchmarks repository's splashrun, with 4 threads.
 S2 = lambda d, *a: [os.path.join(SPLASH2, d)] + list(a)

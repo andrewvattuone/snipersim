@@ -59,7 +59,8 @@ RUN_SPECIFIC = ('output_dir', 'trace_prefix', 'script0name')
 
 
 def is_policy_key(sec, k):
-    return sec in POLICY_KEYS or (sec == 'perf_model/l2_cache' and k == 'replacement_policy')
+    # Subsections of the policy sections count too (rl/initial_weights/<feature>)
+    return any(sec == p or sec.startswith(p + '/') for p in POLICY_KEYS) or (sec == 'perf_model/l2_cache' and k == 'replacement_policy')
 
 
 def run_options(cmd):
@@ -292,7 +293,7 @@ def main(argv):
     for e in errors:
         print(f'  ERROR: {e}')
     cols = ['ipc', 'time_us', 'l1d_mpki', 'l2_mpki', 'l2_miss', 'l2_inval', 'l2_dirty_evict', 'l3_miss', 'dram_rd', 'dram_wr']
-    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4']
+    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4', 'rl-n4-frozen', 'rl-n4-prio', 'rl-n4-rand']
     for (w, l3) in sorted({(k[0], k[1]) for k in groups}):
         roi = any(r['roi'] for k, g in groups.items() if k[:2] == (w, l3) for r in g)
         js = [j for j in used if j['workload'] == w and j['l3'] == l3]
