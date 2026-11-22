@@ -19,8 +19,12 @@
  * learning off (frozen weights), and two other selection rules among the same N candidates, a fixed MESI/sharing
  * priority and a seeded random departure from the oldest candidate (Selection, below).
  *
+ * Experimental Stage 7 variant (off by default): how a weight estimates its feature's reward (Estimator, below). The
+ * default is the algorithm's per-event EMA; `discounted_mean` replaces it with a mean discounted by elapsed decisions.
+ *
  *   V(b) = wM*xM + wE*xE + wS*xS + wAT*xAT + wBT*xBT      (higher = more attractive to evict)
  *   w_i += alpha * (r - w_i)                              for the features active in the rewarded snapshot
+ *                                                         (Estimator::ema, the default)
  *
  *   evicted block refilled while still in the history   -1
  *   evicted block's history entry ages out               +1
@@ -34,6 +38,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -132,6 +137,30 @@ inline std::size_t random_draw(std::uint64_t seed, std::uint64_t decision, doubl
   return 1 + static_cast<std::size_t>(splitmix64(h) % static_cast<std::uint64_t>(window - 1));
 }
 
+/*
+ * How each weight estimates "the reward of evicting a block with this feature" (Stage 7, docs/rl/STAGE7.md):
+ *   ema              w <- w + alpha (r - w) at each reward of the feature: the algorithm (default). Its memory is
+ *                    about 1/alpha EVENTS, so a feature rewarded once per decision remembers ~10 decisions and one
+ *                    rewarded once per 100 decisions remembers ~1,000: the weights compared in a decision describe
+ *                    different stretches of time.
+ *   discounted_mean  w = sum_k g_k r_k / sum_k g_k over the feature's rewards r_k, g_k = exp(-(t - t_k) / horizon),
+ *                    t in committed decisions of this cache. Every feature's estimate covers the same stretch of
+ *                    time (about `horizon` decisions), whatever its event rate. The initial weight w0 counts as one
+ *                    pseudo-reward of value w0 at decision 0. alpha is not used. Uses only rewards already received.
+ * Both stay in [-1, 1] and leave the scoring, the selection and every reward event unchanged.
+ */
+enum class Estimator { ema, discounted_mean };
+
+inline std::optional<Estimator> parse_estimator(std::string_view s)
+{
+  if (s == "ema")
+    return Estimator::ema;
+  if (s == "discounted_mean")
+    return Estimator::discounted_mean;
+  return std::nullopt;
+}
+inline constexpr std::string_view name(Estimator e) { return e == Estimator::ema ? "ema" : "discounted_mean"; }
+
 struct RewardConfig {
   Mode mode = Mode::both;
   std::uint32_t window = 4;     // N: how many of the base policy's first candidates are compared (>= 1)
@@ -143,6 +172,9 @@ struct RewardConfig {
   bool learning = true;      // false: rewards are still counted, but no weight ever changes (frozen weights)
   double random_rate = 0.0;  // Selection::random: probability of not evicting the oldest candidate, in [0, 1]
   std::uint64_t seed = 0;    // Selection::random: seed of the draws
+  // Experimental Stage 7 variant (default: the algorithm's EMA)
+  Estimator estimator = Estimator::ema;
+  double horizon = 65536.0; // Estimator::discounted_mean: discount time constant in decisions (> 0)
 };
 
 /*
@@ -154,6 +186,28 @@ class WeightTable
 {
   std::array<double, 3> w_state_{}; // S, E, M
   std::array<double, 2> w_share_{}; // below (BT), above (AT)
+
+  // Estimator::discounted_mean: discounted sums of one feature's rewards and of their count, as of decision `t`
+  struct Discounted {
+    bool started = false;
+    double sum = 0;
+    double count = 0;
+    std::uint64_t t = 0;
+  };
+  std::array<Discounted, 3> d_state_{};
+  std::array<Discounted, 2> d_share_{};
+
+  static void discounted_update(double& w, Discounted& d, double r, std::uint64_t now, double horizon)
+  {
+    if (!d.started) // the current (initial) weight as one pseudo-reward at decision 0
+      d = {true, w, 1.0, 0};
+    const double age = now > d.t ? static_cast<double>(now - d.t) : 0.0;
+    const double g = std::exp(-age / horizon); // 0 after a very long silence: the estimate restarts from r
+    d.sum = d.sum * g + r;
+    d.count = d.count * g + 1.0;
+    d.t = now;
+    w = d.sum / d.count; // |sum| <= count, so w stays in [-1, 1]
+  }
 
   static std::optional<std::size_t> state_index(Mesi s)
   {
@@ -193,6 +247,18 @@ public:
     if (uses_sharing(m)) {
       auto& w = w_share_[f.above ? 1 : 0];
       w += alpha * (r - w);
+    }
+  }
+
+  // Estimator::discounted_mean: add reward r at decision `now` to the features active in `f` (same features as reward)
+  void reward_discounted(Mode m, Features f, double r, std::uint64_t now, double horizon)
+  {
+    if (uses_state(m))
+      if (auto i = state_index(f.state))
+        discounted_update(w_state_[*i], d_state_[*i], r, now, horizon);
+    if (uses_sharing(m)) {
+      const std::size_t i = f.above ? 1 : 0;
+      discounted_update(w_share_[i], d_share_[i], r, now, horizon);
     }
   }
 
@@ -264,7 +330,11 @@ class RewardPolicy
 
   void reward(std::uint32_t set, Features f, double r)
   {
-    if (cfg_.learning)
+    if (!cfg_.learning)
+      return;
+    if (cfg_.estimator == Estimator::discounted_mean) // the clock: decisions committed so far by this cache
+      table(set).reward_discounted(cfg_.mode, f, r, stats.decisions, cfg_.horizon);
+    else
       table(set).reward(cfg_.mode, f, r, cfg_.alpha);
   }
 

@@ -26,7 +26,7 @@ new into Sniper; names are prefixed because every directory under `common/` is o
 | `rl_eviction_history.h` | `EvictionHistory`: per-set history shared by both cores |
 | `rl_lru_order.h` | `LruOrder`: candidate generation with Sniper `CacheSetLRU`'s exact rank semantics |
 | `rl_paper_policy.h` | `PaperPolicy`: ratio weights, rule text/example, AND/OR, next attempt |
-| `rl_reward_policy.h` | `RewardPolicy`: `WeightTable`, EMA rewards, highest-score-among-N, protection feedback; the experimental controls (`Selection`, `priority_rank`, `random_draw`, see [Controls](#controls-for-the-learning-question)) |
+| `rl_reward_policy.h` | `RewardPolicy`: `WeightTable`, EMA rewards, highest-score-among-N, protection feedback; the experimental controls (`Selection`, `priority_rank`, `random_draw`, see [Controls](#controls-for-the-learning-question)); the Stage 7 variant (`Estimator`, see [Stage 7 variant](#stage-7-variant-discounted-mean-estimator-experimental)) |
 | `rl_diagnostics.h` | Stage 4 observers `RewardObserver`, `PaperObserver` (read-only, see [Diagnostics](#diagnostics-stage-4)) |
 
 Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build):
@@ -42,6 +42,7 @@ Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build)
 | `test_event_order.cc` | Regression tests for the order of events on a miss (history lookup before the eviction) |
 | `test_diagnostics.cc` | Stage 4 observers: no decision changes, totals equal the cores' counters, runs, ties, double rewards |
 | `test_controls.cc` | Experimental controls: defaults, initial and frozen weights, priority order and ties, window and eligibility, seeded random draws, diagnostics |
+| `test_estimator.cc` | Stage 7 variant (`Estimator::discounted_mean`): default unchanged, exact discounted mean, time-based span under phase-structured and bursty rewards, prior and learning off, eviction-history and protection hard cases, controls and diagnostics unaffected |
 | `diff_cores.cc` | Differential check against another tree's cores (`make diff-cores OLD=<tree>`), not part of `test` |
 | `Makefile`, `.gitignore` | Build/run; the test and diff binaries and outputs are ignored |
 
@@ -525,6 +526,34 @@ Every counter in the last two bullets expects 0.
 * History accounting closes: inserts − aged out − returned ≤ capacity (2 × K per set).
 * Upgrade carry-overs equal the upgrade refills. All error counters are 0.
 * `coherence_regress` with either policy on the L2 is MESI-consistent and correctly classified, with 0 stale write hits.
+
+#### Stage 7 variant: discounted-mean estimator (experimental)
+
+An opt-in change to how each weight estimates its feature's reward, on the review branch
+`review/stage7-discounted-mean`. The investigation behind it, the design, and why it was chosen over other options
+are in [`STAGE7.md`](STAGE7.md). The default is the algorithm, unchanged.
+
+```
+-g perf_model/l2_cache/rl/estimator=ema              # ema | discounted_mean                  (default ema)
+-g perf_model/l2_cache/rl/horizon=65536              # discounted_mean only, decisions, >= 1  (default 65536)
+```
+
+* **`ema`:** the algorithm's `w ← w + α (r − w)` per reward event.
+* **`discounted_mean`:** each weight is the mean of its feature's rewards, discounted by elapsed decisions:
+  `w = Σ g_k r_k / Σ g_k` with `g_k = exp(−(t − t_k)/horizon)`. Here t counts the cache's committed decisions, and
+  the initial weight is one pseudo-reward at decision 0.
+  * **The same time span for every feature,** whatever its event rate.
+  * **`alpha` is not used.**
+  * **Uses only rewards already received.**
+* **Unchanged:** scoring, selection, eligibility, protection, the history and every reward event.
+* **With the controls:**
+  * `learning=false` keeps the weights bit-identical;
+  * `selection=priority` and `random` do not use the weights;
+  * `initial_weights` sets the prior.
+* **Start-up line:** `[RL] L2 core N: rl_lru STAGE7 estimator=discounted_mean horizon=... decisions (alpha unused)`.
+  Default runs print exactly what they printed before.
+* **Errors:** `rl/horizon` without `estimator=discounted_mean` is a configuration error.
+* **Tests:** `testing/unit/rl/test_estimator.cc`.
 
 ### Event checker
 

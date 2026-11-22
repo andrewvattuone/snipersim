@@ -114,6 +114,13 @@ CacheSetInfoRL::CacheSetInfoRL(String name, String cfgname, core_id_t core_id, U
       LOG_ASSERT_ERROR(seed >= 0, "%s/rl/seed must be >= 0 (%ld)", cfgname.c_str(), (long)seed);
       // One reproducible stream per cache: the configured seed mixed with the core id
       c.seed = rlrepl::splitmix64((std::uint64_t)seed ^ ((std::uint64_t)core_id << 32));
+      // Experimental Stage 7 variant (docs/rl/STAGE7.md); the default is the algorithm's EMA
+      c.estimator = parseKey<rlrepl::Estimator>(cfgname + "/rl/estimator", "ema", rlrepl::parse_estimator);
+      const bool horizon_set = Sim()->getCfg()->hasKey(cfgname + "/rl/horizon");
+      c.horizon = Sim()->getCfg()->getFloatDefault(cfgname + "/rl/horizon", 65536.0);
+      LOG_ASSERT_ERROR(std::isfinite(c.horizon) && c.horizon >= 1.0, "%s/rl/horizon must be a finite number >= 1 (%f)", cfgname.c_str(), c.horizon);
+      LOG_ASSERT_ERROR(c.estimator == rlrepl::Estimator::discounted_mean || !horizon_set,
+                       "%s/rl/horizon is only used with rl/estimator=discounted_mean", cfgname.c_str());
       rlrepl::WeightTable initial;
       const char *const weight_keys[5] = {"S", "E", "M", "BT", "AT"};
       double w[5];
@@ -139,6 +146,9 @@ CacheSetInfoRL::CacheSetInfoRL(String name, String cfgname, core_id_t core_id, U
          printf("[RL] %s core %d: rl_lru CONTROL selection=%s learning=%d random_rate=%g seed=%ld (stream %016llx) initial weights S=%g E=%g M=%g BT=%g AT=%g\n",
                 name.c_str(), core_id, std::string(rlrepl::name(c.selection)).c_str(), (int)c.learning, c.random_rate, (long)seed,
                 (unsigned long long)c.seed, w[0], w[1], w[2], w[3], w[4]);
+      if (c.estimator != rlrepl::Estimator::ema)
+         printf("[RL] %s core %d: rl_lru STAGE7 estimator=%s horizon=%g decisions (alpha unused)\n", name.c_str(), core_id,
+                std::string(rlrepl::name(c.estimator)).c_str(), c.horizon);
    }
    registerStats(name, core_id);
    setupDiagnostics(name, cfgname, core_id, associativity, num_sets);
