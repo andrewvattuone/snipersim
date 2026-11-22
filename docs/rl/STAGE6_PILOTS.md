@@ -513,8 +513,8 @@ before any 1 MB L3 runs.
 ## After Pilot 3
 
 * **Next Stage 6 priority:** reproducing the paper's CAP Bench workloads (FAST, FN, GF, IS, KM, LU, TSP), before
-  Stage 7 or any change to the RL algorithm. The feasibility and qualification findings are reported separately
-  for review.
+  Stage 7 or any change to the RL algorithm. Setup, tooling review, qualification and reproduction limits:
+  [`CAPBENCH.md`](CAPBENCH.md).
 * **Not planned:** more repetitions of the Ocean/Barnes matrix. The differences are at the noise level and
   are limited by what the workloads expose, not by the number of samples.
 * **Needed before any claim about learning:** the no-learning controls listed in Pilot 3.

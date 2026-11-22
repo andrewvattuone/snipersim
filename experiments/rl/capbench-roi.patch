@@ -1,0 +1,257 @@
+diff --git x86/src/FAST/main.c x86/src/FAST/main.c
+index ed5710f..ed2e05a 100644
+--- x86/src/FAST/main.c
++++ x86/src/FAST/main.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <global.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <math.h>
+ #include <omp.h>
+ #include <stdint.h>
+@@ -268,9 +269,11 @@ int main(int argc, char **argv)
+ 	/* Detect corners. */
+ 	if (verbose)
+ 		printf("detecting corners...\n");
++	SimRoiStart();
+ 	start = timer_get();
+ 	numcorners = fast(img, p->imgsize, mask);
+ 	end = timer_get();
++	SimRoiEnd();
+ 	
+ #ifdef _XEON_PHI_
+ 	power = power_end();
+diff --git x86/src/FN/main.c x86/src/FN/main.c
+index 8f70a46..c8a70ae 100644
+--- x86/src/FN/main.c
++++ x86/src/FN/main.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <omp.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -32,6 +33,7 @@ static struct problem small    =  {  100001,  116384 };
+ static struct problem standard =  {  500001,  532768 };
+ static struct problem large    =  { 2000001, 2032768 };
+ static struct problem huge     =  { 8000001, 8065536 };
++static struct problem paper    =  { 8000001, 8016384 }; /* Souza & Freitas 2024: 8e6+1 .. 8e6+2^14 */
+ 
+ /* Be verbose? */
+ int verbose = 0;
+@@ -100,6 +102,8 @@ static void readargs(int argc, char **argv)
+ 						p = &large;
+ 					else if (!strcmp(argv[i], "huge"))
+ 						p = &huge;
++					else if (!strcmp(argv[i], "paper"))
++						p = &paper;
+ 					else 
+ 						usage();
+ 					state = READ_ARG;
+@@ -158,9 +162,11 @@ int main(int argc, char **argv)
+ 	/* Compute friendly numbers. */
+ 	if (verbose)
+ 		printf("computing friendly numbers...\n");
++	SimRoiStart();
+ 	start = timer_get();
+ 	friendly_numbers(p->start, p->end);
+ 	end = timer_get();
++	SimRoiEnd();
+ 	
+ #ifdef _XEON_PHI_
+ 	power = power_end();
+diff --git x86/src/GF/main.c x86/src/GF/main.c
+index 514bd77..926532d 100644
+--- x86/src/GF/main.c
++++ x86/src/GF/main.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <global.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <math.h>
+ #include <omp.h>
+ #include <stdint.h>
+@@ -214,9 +215,11 @@ int main(int argc, char **argv)
+ 	power_init();
+ #endif
+ 
++	SimRoiStart();
+ 	start = timer_get();
+ 	gauss_filter(img, p->imgsize, mask, p->masksize);
+ 	end = timer_get();
++	SimRoiEnd();
+ 	
+ #ifdef _XEON_PHI_
+ 	power = power_end();
+diff --git x86/src/IS/main.c x86/src/IS/main.c
+index abd87f0..866484f 100644
+--- x86/src/IS/main.c
++++ x86/src/IS/main.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <math.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <omp.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -174,9 +175,11 @@ int main(int argc, char **argv)
+ 	/* Cluster data. */
+ 	if (verbose)
+ 		printf("sorting...\n");
++	SimRoiStart();
+ 	start = timer_get();
+ 	integer_sort(a, p->n);
+ 	end = timer_get();
++	SimRoiEnd();
+ 	
+ #ifdef _XEON_PHI_
+ 	power = power_end();
+diff --git x86/src/KM/kmeans.c x86/src/KM/kmeans.c
+index 3a88020..c487dbd 100644
+--- x86/src/KM/kmeans.c
++++ x86/src/KM/kmeans.c
+@@ -1,4 +1,5 @@
+ /* Kernel Include */
++#include <sim_api.h> /* Sniper iteration markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <global.h>
+ #include <util.h>
+ #include "km.h"
+@@ -149,9 +150,13 @@ int *kmeans(float *_points, int _npoints, int _ncentroids, int _dimension) {
+ 		omp_init_lock(&lock[i]);
+ 
+ 	/* Iterate over points until all clusters are defined. */
++	int iteration = 0;
+ 	do {
++		++iteration;
++		SimMarker(1, iteration);
+ 		populate();
+ 		compute_centroids();
++		SimMarker(2, iteration);
+ 
+ 		for (i = 0; i < nthreads; i++){
+ 			if (has_changed[i] == 1)
+diff --git x86/src/KM/main.c x86/src/KM/main.c
+index ce55e65..ba8cf62 100644
+--- x86/src/KM/main.c
++++ x86/src/KM/main.c
+@@ -1,5 +1,6 @@
+ /* Kernel Include */
+ #include <timer.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <util.h>
+ #include "km.h"
+ 
+@@ -21,6 +22,7 @@ static struct problem small    = {  8192, 512};
+ static struct problem standard = { 16384, 1024};
+ static struct problem large    = { 32768, 1024};
+ static struct problem huge     = { 65536, 1024};
++static struct problem paper    = { 16384,  512}; /* Souza & Freitas 2024: 2^14 points in R^16, 512 centroids */
+ 
+ static int seed = 0;              /* Seed number. */      
+ static struct problem *p = &tiny; /* Problem. */   
+@@ -78,6 +80,8 @@ static void readargs(int argc, char **argv) {
+ 						p = &large;
+ 					else if (!strcmp(argv[i], "huge"))
+ 						p = &huge;
++					else if (!strcmp(argv[i], "paper"))
++						p = &paper;
+ 					else 
+ 						usage();
+ 					state = READ_ARG;
+@@ -152,9 +156,11 @@ int main(int argc, char **argv) {
+ 	/* Cluster data. */
+ 	if (verbose)
+ 		printf("clustering data...\n");
++	SimRoiStart();
+ 	start = timer_get();
+ 	map = kmeans(points, p->npoints, p->ncentroids, dimension);
+ 	end = timer_get();
++	SimRoiEnd();
+ 
+ #ifdef _XEON_PHI_
+ 	power = power_end();
+diff --git x86/src/LU/lower_upper.c x86/src/LU/lower_upper.c
+index 5aa5099..c28ade3 100644
+--- x86/src/LU/lower_upper.c
++++ x86/src/LU/lower_upper.c
+@@ -4,6 +4,7 @@
+  * lu.c - Lower Upper Benchmark Kerkernl.
+  */
+ 
++#include <sim_api.h> /* Sniper iteration markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <assert.h>
+ #include <global.h>
+ #include <math.h>
+@@ -141,6 +142,7 @@ int lower_upper(struct matrix *m, struct matrix *l, struct matrix *u)
+ 	/* Apply elimination on all rows. */
+ 	for (i = 0; i < m->height - 1; i++)
+ 	{
++		SimMarker(1, i + 1);
+ 		pivot = _find_pivot(m, i, i);	
+ 	
+ 		/* Impossible to solve. */
+@@ -151,6 +153,7 @@ int lower_upper(struct matrix *m, struct matrix *l, struct matrix *u)
+ 		}
+ 		
+ 		_row_reduction(m, i, pivot);
++		SimMarker(2, i + 1);
+ 	}
+ 	
+ 	/* Build upper and lower matrixes.  */
+diff --git x86/src/LU/main.c x86/src/LU/main.c
+index 7116c9d..2d305c4 100644
+--- x86/src/LU/main.c
++++ x86/src/LU/main.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <omp.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -171,9 +172,11 @@ int main(int argc, char **argv)
+ 	/* Matrix factorization. */
+ 	if (verbose)
+ 		printf("factorizing...\n");
++	SimRoiStart();
+ 	start = timer_get();
+ 	lower_upper(m, l, u);
+ 	end = timer_get();
++	SimRoiEnd();
+ 	
+ #ifdef _XEON_PHI_
+ 	power = power_end();
+diff --git x86/src/TSP/main.c x86/src/TSP/main.c
+index 74b625a..1dabc38 100644
+--- x86/src/TSP/main.c
++++ x86/src/TSP/main.c
+@@ -1,6 +1,7 @@
+ #define _GNU_SOURCE
+ 
+ #include <stdio.h>
++#include <sim_api.h> /* Sniper ROI markers (snipersim experiments/rl/capbench-roi.patch) */
+ #include <stdlib.h>
+ #include <limits.h>
+ #include <sched.h>
+@@ -226,6 +227,7 @@ void run_tsp (int nb_threads, int nb_towns, int seed, int nb_clusters) {
+ 	pthread_t **tids = (pthread_t **) malloc (sizeof(pthread_t *) * nb_clusters);
+ 	assert (tids != NULL);	
+ 	
++	SimRoiStart();
+ 	start = timer_get();
+ 	for (i = 0; i < nb_clusters; i++)
+ 		tids[i] = spawn(&tsps[i], i, nb_clusters, nb_partitions, nb_threads, nb_towns, seed);
+@@ -238,6 +240,7 @@ void run_tsp (int nb_threads, int nb_towns, int seed, int nb_clusters) {
+ 	free(tsps);
+ 
+ 	end = timer_get();
++	SimRoiEnd();
+ 	
+ #ifdef _XEON_PHI_
+ 	power = power_end();

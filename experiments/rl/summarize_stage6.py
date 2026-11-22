@@ -44,7 +44,39 @@ import sys
 
 CHECKS = ('check_sharers.py', 'check_rl_events.py', 'check_rl_policy.py')
 POLICY_KEYS = ('perf_model/l2_cache/sf', 'perf_model/l2_cache/rl', 'perf_model/l2_cache/rl_diag')
-RUN_SPECIFIC = ('output_dir', 'trace_prefix')
+# Run-specific paths; script0name is run-sniper's generated sim.scripts.py in the run directory (the scripts it runs
+# and their arguments are compared through the run-sniper options instead, see run_options)
+RUN_SPECIFIC = ('output_dir', 'trace_prefix', 'script0name')
+
+
+def is_policy_key(sec, k):
+    return sec in POLICY_KEYS or (sec == 'perf_model/l2_cache' and k == 'replacement_policy')
+
+
+def run_options(cmd):
+    """The run-sniper options of a recorded command, without the output directory and the policy keys."""
+    opts, it = [], iter(cmd[:cmd.index('--')] if '--' in cmd else cmd)
+    for t in it:
+        if t == '-d':
+            next(it, None)
+        elif t == '-g':
+            g = next(it, '')
+            key = g.split('=', 1)[0]
+            if not is_policy_key(key.rsplit('/', 1)[0], key.rsplit('/', 1)[-1]):
+                opts += [t, g]
+        else:
+            opts.append(t)
+    return tuple(opts)
+
+
+def roi_end(j):
+    """How the run's region ended; inferred from the command for runs recorded before the roi_end field."""
+    if 'roi_end' in j:
+        return j['roi_end']
+    if not j.get('roi'):
+        return None
+    cmd = ' '.join(j.get('cmd', []))
+    return 'instruction-limit' if 'stop-by-icount' in cmd else 'iteration-marker' if 'roi-iter' in cmd else 'application'
 
 
 def load(run):
@@ -68,7 +100,7 @@ def load_cfg(run):
             sec = line.strip('[]')
         elif '=' in line:
             k, v = (x.strip() for x in line.split('=', 1))
-            if sec in POLICY_KEYS or (sec == 'perf_model/l2_cache' and k == 'replacement_policy') or k in RUN_SPECIFIC:
+            if is_policy_key(sec, k) or k in RUN_SPECIFIC:
                 continue
             cfg[(sec, k)] = v
     return cfg
@@ -201,6 +233,10 @@ def main(argv):
     dirty = [j['name'] for j in used if not j.get('tree_clean', True)]
     if dirty:
         errors.append(f'{len(dirty)} runs made with uncommitted simulator changes (tree_clean false): {dirty[:3]}')
+    # Recorded since the CAP Bench tooling; earlier runs have no tooling_clean field
+    loose = [j['name'] for j in used if j.get('tooling_clean') is False]
+    if loose:
+        errors.append(f'{len(loose)} runs made with uncommitted experiment tooling (tooling_clean false): {loose[:3]}')
     groups = {}
     for r in rows:
         groups.setdefault((r['workload'], r['l3'], r['policy']), []).append(r)
@@ -216,6 +252,12 @@ def main(argv):
                 bad.append(f'{j["name"]}: ' + ', '.join(f'[{sec}] {k}: {ref.get((sec, k), "absent")} vs {c.get((sec, k), "absent")}'
                                                         for sec, k in dict.fromkeys(k for k, _ in diff)))
         cmds = {tuple(j['cmd'][j['cmd'].index('--'):]) for j in g}
+        ends = {roi_end(j) for j in g}
+        opts = {run_options(j['cmd']) for j in g}
+        if len(opts) > 1:
+            errors.append(f'{w} L3 {l3}: {len(opts)} different run-sniper options (beyond policy keys): {sorted(opts)}')
+        if len(ends) > 1:
+            errors.append(f'{w} L3 {l3}: regions ended differently (roi_end {sorted(map(str, ends))}): not the same work')
         inputs = {(j.get('workload_md5'), j.get('stdin_md5')) for j in g}
         print(f'config check {w} L3 {l3}: {len(g)} runs vs {g[0]["name"]}: '
               + ('identical apart from the policy keys' if not bad else f'{len(bad)} runs DIFFER'))
@@ -230,8 +272,15 @@ def main(argv):
     order = ['lru', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4']
     for (w, l3) in sorted({(k[0], k[1]) for k in groups}):
         roi = any(r['roi'] for k, g in groups.items() if k[:2] == (w, l3) for r in g)
-        print(f'\n== {w}, L3 {l3} KB, {"region of interest" if roi else "whole run"}: mean of repetitions '
-              f'(spread = (max - min) / mean); change vs LRU')
+        js = [j for j in used if j['workload'] == w and j['l3'] == l3]
+        end = roi_end(js[0]) if js else None
+        region = ('whole run' if not roi else {None: 'region of interest', 'application': 'region of interest',
+                  'instruction-limit': 'region of interest truncated at an instruction count (fixed instructions, '
+                                       'not fixed work: compare per-instruction rates, not time)',
+                  'iteration-marker': 'complete marked iterations'}.get(end, end))
+        inp = js[0].get('input') if js else None
+        print(f'\n== {w}, L3 {l3} KB, {region}' + (f', {inp} input' if inp else '')
+              + ': mean of repetitions (spread = (max - min) / mean); change vs LRU')
         base = groups.get((w, l3, 'lru'))
         print('  ' + f'{"policy":11s}' + ''.join(f'{c:>17s}' for c in cols))
         for p in order:

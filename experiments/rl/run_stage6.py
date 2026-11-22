@@ -9,7 +9,14 @@ the only cache with the policy under test, prefetchers off, traceinput/num_runs 
 SNIPER_RL_EVENT_CHECK=1 / SNIPER_COHERENCE_CHECK=1 for the checkers. The RL policies run with rl_diag/enabled =
 true (observation only; it changes no decision). Each run directory is OUTDIR/<workload>-l3-<KB>-<policy>-r<rep>.
 Workloads marked roi run with --roi: only the program's region of interest is simulated in detail (the caches are
-warmed before it) and sim.stats covers that region alone.
+warmed before it) and sim.stats covers that region alone. A workload's own run-sniper options (WORKLOADS[...]['sniper'])
+can bound that region differently, and its roi_end names how the region must end (recorded per run as roi_end):
+  application        the program's SimRoiEnd() marker (default);
+  instruction-limit  Sniper's stop-by-icount ends it after N instructions summed over all cores (a fixed instruction
+                     count, not a fixed amount of work: compare per-instruction rates, not completion time);
+  iteration-marker   experiments/rl/roi-iter-sync.py (with --roi-script) runs complete iterations between the program's
+                     SimMarker(1, i) / SimMarker(2, i) markers in detail (a fixed amount of work).
+CAP Bench workloads also carry input = paper (the inputs of Souza & Freitas 2024) or exploratory (reduced inputs).
 
 Timeout: each workload has its own bound (WORKLOADS[...]['timeout'], about 2x its measured wall time with several
 simulations in parallel); --timeout overrides it for every workload. The bound used is recorded per run. On a
@@ -62,6 +69,12 @@ POLICIES = {
 # Workloads: name -> command after `--`, whether to simulate the ROI only, and an optional stdin file.
 # The SPLASH-2 arguments are those of the benchmarks repository's splashrun, with 4 threads.
 S2 = lambda d, *a: [os.path.join(SPLASH2, d)] + list(a)
+# CAP Bench from https://github.com/cart-pucminas/CAPBenchmarks, built by build_capbench.sh outside this tree into a
+# directory named after the md5 of the patch it applied, so a build can only be used with the patch it was made from
+CAPB_PATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capbench-roi.patch')
+CAPB = os.environ.get('CAPB_BIN', os.path.join(os.path.dirname(ROOT), 'capbench-build-'
+                      + hashlib.md5(open(CAPB_PATCH, 'rb').read()).hexdigest()[:8], 'bin'))
+CB = lambda k, cls: [os.path.join(CAPB, k + '.intel'), '--class', cls, '--nthreads', '4']
 # timeout: per-run bound in seconds, from the measured wall time (comment) with 4-5 simulations in parallel.
 WORKLOADS = {
     'sharetest-r': dict(cmd=[os.path.join(E, 'sharetest'), 'r', '4'], timeout=600),                    # 32-35 s
@@ -78,7 +91,30 @@ WORKLOADS = {
     # Not measured: about 5x barnes-4096 by instruction count (1.85 G vs 0.38 G)
     'barnes-small': dict(cmd=S2('apps/barnes/BARNES'), roi=True, stdin=os.path.join(INPUTS, 'barnes-16384-p4.in'),
                          timeout=10800),
+    # CAP Bench x86/OpenMP kernels (build_capbench.sh; docs/rl/CAPBENCH.md), 4 threads. ROI instruction counts (SDE,
+    # 4 threads) in comments.
+    # Paper inputs, first 500 M ROI instructions only (results/stage6-capbench-qual; the full kernels are 8-55 G).
+    # IS's 5 G-instruction initialization is fast-forwarded (--no-cache-warming): cold caches at the ROI.
+    'capb-is-500m': dict(cmd=CB('is', 'standard'), roi=True, input='paper', roi_end='instruction-limit', timeout=3600,
+                         sniper=['-s', 'stop-by-icount:500000000', '--no-cache-warming']),   # > 3,600 s: timed out
+    'capb-lu-500m': dict(cmd=CB('lu', 'standard'), roi=True, input='paper', roi_end='instruction-limit', timeout=3600,
+                         sniper=['-s', 'stop-by-icount:500000000']),                          # 1,720 s
+    'capb-km-500m': dict(cmd=CB('km', 'paper'), roi=True, input='paper', roi_end='instruction-limit', timeout=3600,
+                         sniper=['-s', 'stop-by-icount:500000000']),                          # 624 s
+    # Paper input, two complete K-Means iterations in detail (1.78 G + 1.77 G), with a statistics snapshot at the start
+    # of iteration 2 so that iteration 2 (warm caches, reuse of the points) can be measured alone. Initialization
+    # (7 M) is fast-forwarded. Not measured: ~0.84 MIPS (capb-km-500m) -> ~4,200 s.
+    'capb-km-paper-it2': dict(cmd=CB('km', 'paper'), roi=True, input='paper', roi_end='iteration-marker', timeout=9000,
+                              sniper=['-s', 'experiments/rl/roi-iter-sync::1:2:2', '--roi-script', '--no-cache-warming']),
+    # Exploratory input: LU `tiny` (512 x 512), the whole factorization (ROI 0.71 G of 0.72 G instructions).
+    # Not measured: 0.3-0.8 MIPS -> ~900-2,400 s.
+    'capbx-lu-tiny': dict(cmd=CB('lu', 'tiny'), roi=True, input='exploratory', timeout=5400),
+    # Smoke test of the iteration markers: LU `tiny`, steps 2-4 detailed (~5 M instructions), snapshot at step 4
+    'capbx-lu-tiny-smoke': dict(cmd=CB('lu', 'tiny'), roi=True, input='exploratory', roi_end='iteration-marker',
+                                timeout=600, sniper=['-s', 'experiments/rl/roi-iter-sync::2:4:4', '--roi-script',
+                                                     '--no-cache-warming']),
 }
+ROI_END_SIGNS = {'instruction-limit': '[STOPBYICOUNT] Ending ROI after', 'iteration-marker': '[ROIITERSYNC] End of iteration'}
 COMMON = ['traceinput/num_runs=1',
           'perf_model/l1_icache/prefetcher=none', 'perf_model/l1_dcache/prefetcher=none', f'{L2}/prefetcher=none']
 
@@ -87,14 +123,21 @@ def md5(path):
     return hashlib.md5(open(path, 'rb').read()).hexdigest() if os.path.exists(path) else None
 
 
+def build_info(binary):
+    """First line of the BUILD_INFO beside a build_capbench.sh build (source revision and patch md5), if any."""
+    f = os.path.join(os.path.dirname(os.path.dirname(binary)), 'BUILD_INFO')
+    return open(f).readline().strip() if os.path.exists(f) else None
+
+
 def command(policy, workload, l3, outdir):
     cmd = ['./run-sniper', '-n', '4', '-c', 'gainestown']
     for g in COMMON + [f'perf_model/l3_cache/cache_size={l3}'] + POLICIES[policy]:
         cmd += ['-g', g]
     if policy != 'lru':
         cmd += ['-g', f'{L2}/rl_diag/enabled=true']
-    if WORKLOADS[workload].get('roi'):
+    if WORKLOADS[workload].get('roi') and '--roi-script' not in WORKLOADS[workload].get('sniper', []):
         cmd += ['--roi']
+    cmd += WORKLOADS[workload].get('sniper', [])
     return cmd + ['-d', outdir, '--'] + WORKLOADS[workload]['cmd']
 
 
@@ -177,12 +220,16 @@ def run_one(job, manifest, checkers_txt):
     text = open(outdir + '.log', errors='ignore').read()
     stats = os.path.exists(os.path.join(outdir, 'simulation', 'sim.stats'))
     crashed = 'Internal exception' in text
-    # With --roi the detailed models must have been switched on and off by the program's markers
-    roi_seen = not job['roi'] or ('Enabling performance models' in text and 'Disabling performance models' in text)
+    # The detailed models must have been switched on and off once, and the region must have ended the expected way
+    roi_end = None
+    if job['roi'] and 'Disabling performance models' in text:
+        roi_end = next((k for k, v in ROI_END_SIGNS.items() if v in text), 'application')
+    roi_seen = not job['roi'] or ('Enabling performance models' in text and roi_end == job['roi_end_expected'])
     ok = rc == 0 and stats and not crashed and not timed_out and roi_seen
     checks = run_checks(outdir, job['policy'], checkers_txt) if ok else {}
     checks_ok = bool(checks) and all(checks.values())
     job.update(exit=rc, wall_s=round(wall, 1), timed_out=timed_out, crashed=crashed, stats=stats, roi_seen=roi_seen,
+               roi_end=roi_end,
                checks=checks, status='ok' if ok and checks_ok else ('FAILED (checks)' if ok else 'FAILED'))
     with _manifest_lock, open(manifest, 'a') as f:
         f.write(json.dumps(job) + '\n')
@@ -215,6 +262,9 @@ def main():
     provenance = dict(commit=git('rev-parse', 'HEAD').stdout.strip(),
                       branch=git('rev-parse', '--abbrev-ref', 'HEAD').stdout.strip(),
                       tree_clean=git('diff', '--quiet', 'HEAD', '--', 'common', 'simulator', 'sift', 'config').returncode == 0,
+                      # the experiment tooling itself (this runner, the build scripts, the patch, the inputs)
+                      tooling_clean=git('diff', '--quiet', 'HEAD', '--', 'experiments').returncode == 0
+                      and not git('ls-files', '--others', '--exclude-standard', '--', 'experiments').stdout.strip(),
                       binary_md5=md5(os.path.join(ROOT, 'build', 'default', 'lib', 'sniper')),
                       env='SNIPER_RL_EVENT_CHECK=1 SNIPER_COHERENCE_CHECK=1')
     jobs = []
@@ -228,7 +278,10 @@ def main():
                     jobs.append(dict(name=name, policy=p, workload=w, l3=int(l3), rep=rep, dir=d, cmd=command(p, w, l3, d),
                                      roi=bool(spec.get('roi')), stdin=spec.get('stdin'),
                                      stdin_md5=md5(spec['stdin']) if spec.get('stdin') else None,
-                                     workload_md5=md5(spec['cmd'][0]), timeout_s=a.timeout or spec['timeout'],
+                                     workload_md5=md5(spec['cmd'][0]), workload_build=build_info(spec['cmd'][0]),
+                                     input=spec.get('input'),
+                                     roi_end_expected=spec.get('roi_end', 'application') if spec.get('roi') else None,
+                                     timeout_s=a.timeout or spec['timeout'],
                                      **provenance))
     if a.dry_run:
         for j in jobs:
