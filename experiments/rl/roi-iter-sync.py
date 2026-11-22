@@ -16,10 +16,14 @@
 # Difference from roi-iter.py: a marker only queues a mode switch; the switch itself happens at the next periodic
 # instruction callback (core/hook_periodic_ins, every ins_global = 1 M instructions summed over all cores), the
 # same point at which Sniper's stop-by-icount switches, rather than inside one thread's marker instruction. Each
-# boundary therefore moves by about ins_global instructions or less after its marker (up to 1.05 M seen); the shift
-# is printed. Verified: fast-forward -> detailed at such a point and detailed -> fast-forward at the end pass every
-# checker for LU tiny with all five policies. Not separately tested: whether roi-iter.py's immediate switch alone
-# also breaks them.
+# boundary therefore lies up to about ins_global instructions after its marker.
+#
+# Every switch is logged on one line that run_stage6.py records in the manifest (roi_switches):
+#   [ROIITERSYNC] switch <action> iteration <i> marker-icount <m> switch-icount <s> offset <s - m>
+# (action: warmup, detailed, snapshot, end; icount = instructions summed over all cores since the start), and at the
+# end of the simulation every marker seen is summarized, with any departure from the order
+# SimMarker(1, 1), SimMarker(2, 1), SimMarker(1, 2), ... :
+#   [ROIITERSYNC] markers begin <n1> end <n2> first <i> last <j> order-violations <k>
 import sim
 
 
@@ -31,11 +35,27 @@ class RoiIterSync:
     self.end_detailed = int(args.get(2, '') or -1)
     self.snapshot = int(args.get(3, '') or -1)
     self.state = 'init'
-    self.pending = []        # queued (action, iteration, icount at the marker), applied in order
-    print('[ROIITERSYNC] warm-up from iteration %d, detailed from iteration %d to the end of iteration %d'
-          % (self.start_warmup, self.start_detailed, self.end_detailed))
+    self.pending = []        # queued (action, iteration, icount at the marker, state after), applied in order
+    self.seen = {1: 0, 2: 0}
+    self.first = self.last = None
+    self.expect = (1, None)  # next marker expected: (kind, iteration); None = any iteration
+    self.violations = 0
+    print('[ROIITERSYNC] warm-up from iteration %d, detailed from iteration %d to the end of iteration %d, snapshot at %d'
+          % (self.start_warmup, self.start_detailed, self.end_detailed, self.snapshot))
 
   def hook_magic_marker(self, core, thread, a, b, s):
+    if a not in (1, 2):
+      return
+    self.seen[a] += 1
+    self.first = b if self.first is None else self.first
+    self.last = b
+    kind, it = self.expect
+    if a != kind or (it is not None and b != it):
+      self.violations += 1
+      if self.violations <= 5:
+        print('[ROIITERSYNC] marker order: got SimMarker(%d, %d), expected SimMarker(%d, %s)' % (a, b, kind, it))
+    self.expect = (2, b) if a == 1 else (1, b + 1)
+
     # The state the queued switches will leave, so that a marker arriving before the next callback is still seen
     state = self.pending[-1][3] if self.pending else self.state
     at = sim.stats.icount()
@@ -55,23 +75,25 @@ class RoiIterSync:
       self.apply(*self.pending.pop(0))
 
   def apply(self, action, b, at, _):
-    shift = sim.stats.icount() - at
+    now = sim.stats.icount()
+    print('[ROIITERSYNC] switch %s iteration %d marker-icount %d switch-icount %d offset %d' % (action, b, at, now, now - at))
     if action == 'warmup':
-      print('[ROIITERSYNC] Start of iteration %d: going to WARMUP (%d instructions after the marker)' % (b, shift))
       sim.control.set_instrumentation_mode(sim.control.WARMUP)
       self.state = 'warmup'
     elif action == 'snapshot':
-      print('[ROIITERSYNC] Start of iteration %d: statistics snapshot iter-%d-begin (%d instructions after the marker)'
-            % (b, b, shift))
       sim.stats.write('iter-%d-begin' % b)
     elif action == 'detailed':
-      print('[ROIITERSYNC] Start of iteration %d: beginning ROI (%d instructions after the marker)' % (b, shift))
       sim.control.set_roi(True)
       self.state = 'detailed'
     else:
-      print('[ROIITERSYNC] End of iteration %d: ending ROI (%d instructions after the marker)' % (b, shift))
       sim.control.set_roi(False)
       self.state = 'done'
+
+  def hook_sim_end(self):
+    if self.pending:
+      print('[ROIITERSYNC] %d switches still queued at the end: %s' % (len(self.pending), [p[:2] for p in self.pending]))
+    print('[ROIITERSYNC] markers begin %d end %d first %s last %s order-violations %d'
+          % (self.seen[1], self.seen[2], self.first, self.last, self.violations))
 
 
 sim.util.register(RoiIterSync())

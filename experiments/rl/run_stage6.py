@@ -42,6 +42,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -64,6 +66,11 @@ POLICIES = {
     'rl-n2':      [f'{L2}/replacement_policy=rl_lru', f'{L2}/rl/mode=both', f'{L2}/rl/window=2', f'{L2}/rl/alpha=0.1',
                    f'{L2}/rl/protect_feedback=true', f'{L2}/rl/weight_scope=global'],
     'rl-n4':      [f'{L2}/replacement_policy=rl_lru', f'{L2}/rl/mode=both', f'{L2}/rl/window=4', f'{L2}/rl/alpha=0.1',
+                   f'{L2}/rl/protect_feedback=true', f'{L2}/rl/weight_scope=global'],
+    # Not a policy under test: LRU's victim sequence (alpha 0 keeps every weight 0, so every decision is LRU's;
+    # Stage 3 verified the identical victim sequence, POLICY_CORES.md) with the eviction history and rl_diag, to
+    # measure reuse just beyond the L2's capacity (misses on blocks still in the 16-entry per-set history).
+    'lru-hist':   [f'{L2}/replacement_policy=rl_lru', f'{L2}/rl/mode=both', f'{L2}/rl/window=2', f'{L2}/rl/alpha=0',
                    f'{L2}/rl/protect_feedback=true', f'{L2}/rl/weight_scope=global'],
 }
 # Workloads: name -> command after `--`, whether to simulate the ROI only, and an optional stdin file.
@@ -102,19 +109,24 @@ WORKLOADS = {
     'capb-km-500m': dict(cmd=CB('km', 'paper'), roi=True, input='paper', roi_end='instruction-limit', timeout=3600,
                          sniper=['-s', 'stop-by-icount:500000000']),                          # 624 s
     # Paper input, two complete K-Means iterations in detail (1.78 G + 1.77 G), with a statistics snapshot at the start
-    # of iteration 2 so that iteration 2 (warm caches, reuse of the points) can be measured alone. Initialization
-    # (7 M) is fast-forwarded. Not measured: ~0.84 MIPS (capb-km-500m) -> ~4,200 s.
+    # of iteration 2; `measure` is iteration 2 alone (warm caches, reuse of the points). Initialization (7 M) is
+    # fast-forwarded. Not measured: ~0.84 MIPS (capb-km-500m) -> ~4,200 s.
     'capb-km-paper-it2': dict(cmd=CB('km', 'paper'), roi=True, input='paper', roi_end='iteration-marker', timeout=9000,
+                              measure='iter-2-begin:roi-end',
                               sniper=['-s', 'experiments/rl/roi-iter-sync::1:2:2', '--roi-script', '--no-cache-warming']),
-    # Exploratory input: LU `tiny` (512 x 512), the whole factorization (ROI 0.71 G of 0.72 G instructions).
-    # Not measured: 0.3-0.8 MIPS -> ~900-2,400 s.
+    # Exploratory input: LU `tiny` (512 x 512), the whole factorization (ROI 0.71 G of 0.72 G instructions). Exploratory
+    # also because upstream LU pivots on the smallest-magnitude element (docs/rl/CAPBENCH.md): the factorization is
+    # numerically meaningless and its data-dependent swaps may differ from a correct LU's. Not measured: 0.3-0.8 MIPS
+    # -> ~900-2,400 s.
     'capbx-lu-tiny': dict(cmd=CB('lu', 'tiny'), roi=True, input='exploratory', timeout=5400),
-    # Smoke test of the iteration markers: LU `tiny`, steps 2-4 detailed (~5 M instructions), snapshot at step 4
+    # Smoke test of the iteration markers: LU `tiny`, steps 2-4 detailed (~5 M instructions), measure step 4 alone
     'capbx-lu-tiny-smoke': dict(cmd=CB('lu', 'tiny'), roi=True, input='exploratory', roi_end='iteration-marker',
-                                timeout=600, sniper=['-s', 'experiments/rl/roi-iter-sync::2:4:4', '--roi-script',
-                                                     '--no-cache-warming']),
+                                timeout=600, measure='iter-4-begin:roi-end',
+                                sniper=['-s', 'experiments/rl/roi-iter-sync::2:4:4', '--roi-script', '--no-cache-warming']),
 }
-ROI_END_SIGNS = {'instruction-limit': '[STOPBYICOUNT] Ending ROI after', 'iteration-marker': '[ROIITERSYNC] End of iteration'}
+ROI_END_SIGNS = {'instruction-limit': '[STOPBYICOUNT] Ending ROI after', 'iteration-marker': '[ROIITERSYNC] switch end '}
+SWITCH_RE = re.compile(r'\[ROIITERSYNC\] switch (\w+) iteration (-?\d+) marker-icount (\d+) switch-icount (\d+) offset (\d+)')
+MARKERS_RE = re.compile(r'\[ROIITERSYNC\] markers begin (\d+) end (\d+) first (\S+) last (\S+) order-violations (\d+)')
 COMMON = ['traceinput/num_runs=1',
           'perf_model/l1_icache/prefetcher=none', 'perf_model/l1_dcache/prefetcher=none', f'{L2}/prefetcher=none']
 
@@ -145,7 +157,23 @@ _manifest_lock = threading.Lock()
 _checkers_lock = threading.Lock()
 
 
-def run_checks(outdir, policy, checkers_txt=None):
+def interval_dir(outdir, region):
+    """OUTDIR/<run>/measure: the statistics of the measured interval (dumpstats --partial) beside a copy of sim.cfg,
+    laid out as a run directory so that the summarizer and the checkers can read it. None if it cannot be made."""
+    sim = os.path.join(outdir, 'simulation')
+    r = subprocess.run(['python3', os.path.join(ROOT, 'tools', 'dumpstats.py'), '-d', sim, '--partial', region],
+                       cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0 or '=' not in r.stdout:
+        return None
+    d = os.path.join(outdir, 'measure', 'simulation')
+    os.makedirs(d)
+    open(os.path.join(d, 'sim.stats'), 'w').write(r.stdout)
+    shutil.copy(os.path.join(sim, 'sim.cfg'), d)
+    open(os.path.join(outdir, 'measure', 'REGION'), 'w').write(region + '\n')
+    return os.path.dirname(d)
+
+
+def run_checks(outdir, policy, checkers_txt=None, label=''):
     """Run each applicable checker on one run directory; {script: True/False}. Output goes to checkers_txt."""
     verdicts, text = {}, ''
     scripts = ['check_sharers.py', 'check_rl_events.py'] + (['check_rl_policy.py'] if policy != 'lru' else [])
@@ -155,7 +183,7 @@ def run_checks(outdir, policy, checkers_txt=None):
         text += f'### {script} (exit {r.returncode}, {"PASS" if verdicts[script] else "FAIL"})\n{r.stdout}{r.stderr}\n'
     if checkers_txt:
         with _checkers_lock, open(checkers_txt, 'a') as f:
-            f.write(f'##### {time.strftime("%Y-%m-%d %H:%M:%S")} {os.path.basename(outdir)}\n{text}')
+            f.write(f'##### {time.strftime("%Y-%m-%d %H:%M:%S")} {os.path.basename(outdir)}{label}\n{text}')
     return verdicts
 
 
@@ -225,17 +253,34 @@ def run_one(job, manifest, checkers_txt):
     if job['roi'] and 'Disabling performance models' in text:
         roi_end = next((k for k, v in ROI_END_SIGNS.items() if v in text), 'application')
     roi_seen = not job['roi'] or ('Enabling performance models' in text and roi_end == job['roi_end_expected'])
+    # roi-iter-sync: every deferred switch (marker and switch instruction counts) and the marker order
+    switches = [dict(action=m[0], iteration=int(m[1]), marker_icount=int(m[2]), switch_icount=int(m[3]), offset=int(m[4]))
+                for m in SWITCH_RE.findall(text)]
+    mk = MARKERS_RE.search(text)
+    markers = dict(begin=int(mk[1]), end=int(mk[2]), first=mk[3], last=mk[4], order_violations=int(mk[5])) if mk else None
+    if job['roi_end_expected'] == 'iteration-marker':
+        actions = [x['action'] for x in switches]
+        want = ['detailed'] + (['snapshot'] if job.get('measure') else []) + ['end']
+        roi_seen = roi_seen and actions == want and markers is not None and markers['order_violations'] == 0
     ok = rc == 0 and stats and not crashed and not timed_out and roi_seen
     checks = run_checks(outdir, job['policy'], checkers_txt) if ok else {}
     checks_ok = bool(checks) and all(checks.values())
+    # The measured interval (e.g. one iteration) gets its own statistics and the same checkers
+    measure_checks = None
+    if ok and job.get('measure'):
+        d = interval_dir(outdir, job['measure'])
+        measure_checks = run_checks(d, job['policy'], checkers_txt, f' (interval {job["measure"]})') if d else {}
+        checks_ok = checks_ok and bool(measure_checks) and all(measure_checks.values())
     job.update(exit=rc, wall_s=round(wall, 1), timed_out=timed_out, crashed=crashed, stats=stats, roi_seen=roi_seen,
-               roi_end=roi_end,
+               roi_end=roi_end, roi_switches=switches, roi_markers=markers, measure_checks=measure_checks,
                checks=checks, status='ok' if ok and checks_ok else ('FAILED (checks)' if ok else 'FAILED'))
     with _manifest_lock, open(manifest, 'a') as f:
         f.write(json.dumps(job) + '\n')
     print(f'{time.strftime("%H:%M:%S")} {name:34s} {job["status"]:6s} exit={rc} wall={wall:6.1f}s'
-          + (' TIMEOUT' if timed_out else '') + (' CRASH' if crashed else '')
-          + ''.join(f' {k[:-3]}:FAIL' for k, v in checks.items() if not v), flush=True)
+          + (' TIMEOUT' if timed_out else '') + (' CRASH' if crashed else '') + ('' if roi_seen else ' ROI-BOUNDARY')
+          + ''.join(f' {k[:-3]}:FAIL' for k, v in checks.items() if not v)
+          + ''.join(f' interval-{k[:-3]}:FAIL' for k, v in (measure_checks or {}).items() if not v)
+          + ''.join(f' {x["action"]}@{x["iteration"]}+{x["offset"]}' for x in switches), flush=True)
     return job
 
 
@@ -281,6 +326,7 @@ def main():
                                      workload_md5=md5(spec['cmd'][0]), workload_build=build_info(spec['cmd'][0]),
                                      input=spec.get('input'),
                                      roi_end_expected=spec.get('roi_end', 'application') if spec.get('roi') else None,
+                                     measure=spec.get('measure'),
                                      timeout_s=a.timeout or spec['timeout'],
                                      **provenance))
     if a.dry_run:

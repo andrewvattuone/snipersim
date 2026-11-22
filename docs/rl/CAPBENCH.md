@@ -124,9 +124,48 @@ summarizer refuses to compare runs whose regions ended differently.
   * **What passes:** fast-forward → detailed at the same point (LU `tiny`, steps 2-4, all five policies), and
     detailed → fast-forward at the end.
   * **Consequence:** warm the caches by simulating earlier iterations in detail, then measure the later ones
-    alone through the `iter-D-begin` snapshot (`tools/dumpstats.py --partial iter-D-begin:roi-end`).
-  * **Not done yet:** the summarizer still reports the whole detailed region; a `--partial` option is a follow-up.
+    alone through the `iter-D-begin` snapshot.
   * **Not investigated:** the cause inside the simulator's warm-up mode.
+
+**Measuring one iteration alone** (workload key `measure`, for example `iter-2-begin:roi-end` for KM iteration 2).
+* **The runner:**
+  * **Checks on the full region:** it runs the checkers on the complete detailed region (`sim.stats`).
+  * **Interval statistics:** it writes the interval's statistics (`tools/dumpstats.py --partial`) to
+    `<run>/measure/simulation/sim.stats`, beside a copy of `sim.cfg`, and runs the same checkers on them
+    (`measure_checks`). A run is `ok` only if both sets pass.
+* **The summarizer:**
+  * **`--region FROM:TO`:** it reads every run's statistics for that interval, so IPC, MPKI, misses, evictions,
+    invalidations, victim states, hints and the RL diagnostics all come from the same interval.
+  * **Refusals:** it refuses a run whose `measure` differs from the requested region, or whose interval checks
+    failed.
+  * **RL max-passes:** this is a maximum, not a counter, so it is left out of interval summaries.
+* **Recorded per run** (manifest `roi_switches`): every deferred switch (`detailed`, `snapshot`, `end`), with the
+  instruction count, summed over all cores, at the marker and at the switch, and the offset between them.
+  * **Marker check:** `roi_markers` counts every begin and end marker and any departure from the order
+    `SimMarker(1, 1), SimMarker(2, 1), SimMarker(1, 2), ...`.
+  * **Requirements:** an iteration-marker run is `ok` only if its switches occurred in the expected order and
+    there were no marker-order violations.
+* **Validated** (LU `tiny` smoke test: steps 2-4 detailed, step 4 measured; `lru`, `lru-hist`, `rl-n2`):
+  * **Markers and switches:** all 511 begin and 511 end markers arrived in order; switches detailed → snapshot → end.
+  * **Additivity:** `roi-begin:iter-4-begin` plus `iter-4-begin:roi-end` equals `sim.stats` for every counter
+    (4,092 keys). The 13 exceptions are timestamps and derived values (`*_begin`, `*_end`, `ipc`, `corefreq`,
+    `l1misslat`, ...), none of which the summarizer uses.
+  * **Consistency:** `measure/simulation/sim.stats` equals the `--region` statistics, and the checkers pass on the
+    interval.
+* **Offsets:** 0.37-1.15 M instructions after their markers, summed over the 4 cores.
+  * **KM:** negligible at 1.77 G per iteration (< 0.07% at each end).
+  * **LU:** not negligible at 1.4 M per elimination step. For LU, measure many steps or the whole ROI.
+* **Run-to-run variation:** in this 4 M-instruction window, LRU's step-4 L2 MPKI varied from 2.50 to 3.38 over
+  three identical runs. Such short windows cannot compare policies.
+
+**`lru-hist`** (`run_stage6.py`; not a policy under test): `rl_lru` with `rl/alpha=0`, window 2 and the diagnostics.
+* **Victims:** the weights stay 0, so every decision is LRU's (Stage 3 verified the identical victim sequence; the
+  smoke runs show 0% of decisions differing from LRU).
+* **Measurement:** the eviction history (16 entries per set) and the miss classification are kept. They measure
+  reuse *just beyond* the L2's capacity: misses on blocks evicted within the set's last 16 evictions, which a
+  replacement policy could in principle have kept.
+* **Within capacity:** plain LRU's `L2.access-mru-0..7` (hits by recency position, 7 = least recent) shows only
+  reuse within the L2's capacity.
 * **Checked:** for an instruction-limited run, `sim.stats` is exactly the `roi-begin`..`roi-end` delta: all 3,981
   keys of the KM run.
 
@@ -163,7 +202,16 @@ summarizer refuses to compare runs whose regions ended differently.
       no non-finite values. The values grow to 10^13-10^15, a consequence of the pivot choice below. 6 repeated
       runs at 4 threads and 3 at 1 thread gave the same result.
     * **KM** converges in 17 / 20 / 31 iterations (`tiny` / `small` / `paper`).
-    * **IS's result is not sorted** (see below).
+      * **`paper` input:** 3 runs at 4 threads, 1 at 2 and 1 at 1 gave the same 31 iterations and the identical
+        final assignment (hash of the point-to-centroid map).
+      * **Convergence:** the sum of squared distances falls monotonically from 4.72 × 10^13 after iteration 1 to
+        4.15 × 10^13 at convergence, and no cluster is ever empty.
+      * **The input** is uniform random 16-dimensional points (`randnum() & 0xffff`), so the result is a correct
+        Lloyd's run on data with no natural clusters: meaningful as a computation, not as clustering.
+      * **Fixed work:** the iteration count is fixed by the data and the seed, so each iteration is the same work in
+        every run.
+    * **IS's result is not sorted** (see below). **IS is excluded** from the qualification and from any policy
+      comparison.
 * **Provenance and overwriting:**
   * **Overwriting:** a run directory is never reused, and a build directory is never overwritten.
   * **Manifest:** each line records the commit, `tree_clean` (simulator sources), `tooling_clean` (everything
@@ -186,7 +234,12 @@ summarizer refuses to compare runs whose regions ended differently.
     tiny values. The factorization is numerically meaningless (values grow to ~10^14) but completes. Its access
     pattern is still that of a full-pivoting Gaussian elimination: pivot search over the submatrix, row and column
     swap, row reduction.
-  * **Pivot choice:** it is data-dependent, so the swap targets are too.
+  * **Pivot choice:** it is data-dependent, so the swap targets are too. A correct LU (largest-magnitude pivot)
+    would choose different rows and columns to swap at each step. The upstream code therefore has the same kind of
+    accesses as a correct LU, but not necessarily the same addresses in the swaps. With values of ~10^14 it is also
+    not a numerically valid factorization.
+  * **Consequence:** the upstream LU is kept unchanged for now. **Every LU measurement is exploratory, at every
+    input class**, including `standard`; none reproduces the paper's LU or stands in for a correct LU.
   * **Ties:** the merge's result could in principle depend on the order in which threads enter the critical
     section, but the repeated runs above gave identical results.
 * **TSP, `tsp.c:246`** (`-Wmisleading-indentation`): in `get_next_partition_block_size` only `ret.start = ...` is
@@ -288,9 +341,10 @@ Paper inputs, 8 MB L3, first 500 M ROI instructions. These are workload characte
 7. The number of runs per configuration and how variability was handled.
 8. Whether they observed the LU pivot and IS sorting defects, and whether their copies differ.
 
-## Next two LRU qualification experiments (not run)
+## Next two LRU qualification experiments
 
-Both are defined in `run_stage6.py`, with checks and timeouts. Neither has been run.
+Both are defined in `run_stage6.py`, with checks and timeouts. Each runs with `lru` and with `lru-hist`, the same
+LRU victim sequence plus the eviction history, so that reuse just beyond the L2's capacity can be measured.
 
 1. **`capbx-lu-tiny`** (exploratory input): LU 512 × 512, the whole factorization (ROI 0.71 G of 0.72 G
    instructions; `application` end).
@@ -299,10 +353,12 @@ Both are defined in `run_stage6.py`, with checks and timeouts. Neither has been 
      by which half the work is done. Every step re-reads it: real reuse at the L2's capacity edge.
    * **Sharing:** each step's pivot row is read by all four cores after another core wrote it, and the row and
      column swaps write across thread partitions.
+   * **Exploratory twice over:** a reduced input, and the upstream pivot defect above.
    * **Expected cost:** 900-2,400 s at 0.3-0.8 MIPS; timeout 5,400 s.
 2. **`capb-km-paper-it2`** (paper input): KM `paper`, iterations 1-2 in detail (3.55 G instructions,
    `iteration-marker` end), with a snapshot at the start of iteration 2.
-   * **Measurement:** iteration 1 warms the caches; iteration 2 (1.77 G) is measured alone.
+   * **Measurement:** iteration 1 warms the caches; iteration 2 (1.77 G) is measured alone
+     (`summarize_stage6.py --region iter-2-begin:roi-end`).
    * **Why:** each core's points are 256 kB and the centroids 32 kB, so the per-iteration working set is just
      above the 256 kB L2. LRU then evicts each point before its reuse in the next iteration.
    * **Sharing:** the centroids are read by all cores and written under locks in `compute_centroids`.

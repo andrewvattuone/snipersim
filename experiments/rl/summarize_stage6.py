@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Summarize a run_stage6.py output directory: per-run metrics, mean and spread per configuration, change vs LRU.
 
-Usage: summarize_stage6.py OUTDIR [--csv FILE]
+Usage: summarize_stage6.py OUTDIR [--csv FILE] [--region FROM:TO]
+
+--region FROM:TO summarizes, for every run, only the interval between two of its statistics snapshots (for example
+iter-2-begin:roi-end for one marked iteration, see experiments/rl/roi-iter-sync.py), read with tools/dumpstats.py
+--partial: every metric then comes from that interval. Without it, sim.stats (roi-begin:roi-end, or the whole run) is
+used. A run whose manifest names a measured interval (`measure`) must be summarized with --region set to it (an
+error otherwise), and the interval's own checker verdicts (`measure_checks`) must all have passed. RL max-passes
+is a maximum, not a count: it is reported over the whole detailed region only.
 
 Runs: with several manifest lines for one run, the last is used. A run is used only if its status is "ok", every
 applicable check passed (check_sharers and check_rl_events, plus check_rl_policy for the RL policies), and its
@@ -40,8 +47,10 @@ import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 CHECKS = ('check_sharers.py', 'check_rl_events.py', 'check_rl_policy.py')
 POLICY_KEYS = ('perf_model/l2_cache/sf', 'perf_model/l2_cache/rl', 'perf_model/l2_cache/rl_diag')
 # Run-specific paths; script0name is run-sniper's generated sim.scripts.py in the run directory (the scripts it runs
@@ -79,9 +88,18 @@ def roi_end(j):
     return 'instruction-limit' if 'stop-by-icount' in cmd else 'iteration-marker' if 'roi-iter' in cmd else 'application'
 
 
-def load(run):
+def load(run, region=None):
+    """Statistics of a run: sim.stats, or with region 'FROM:TO' the delta between those two snapshots."""
     s = {}
-    for line in open(os.path.join(run, 'simulation', 'sim.stats')):
+    if region:
+        r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'dumpstats.py'), '-d',
+                            os.path.join(run, 'simulation'), '--partial', region], capture_output=True, text=True)
+        if r.returncode != 0 or '=' not in r.stdout:
+            raise ValueError(f'no statistics for region {region}: {r.stderr.strip()[-200:]}')
+        lines = r.stdout.splitlines()
+    else:
+        lines = open(os.path.join(run, 'simulation', 'sim.stats'))
+    for line in lines:
         m = re.match(r'^(\S+)\s*=\s*(.*)$', line.strip())
         if m:
             try:
@@ -141,7 +159,7 @@ def check_verdicts(j, legacy):
     return True, ''
 
 
-def metrics(s):
+def metrics(s, region=None):
     t = lambda k: sum(s.get(k, [0]))
     for k in ('core.instructions', 'performance_model.cycle_count', 'performance_model.elapsed_time'):
         if k not in s:
@@ -174,7 +192,7 @@ def metrics(s):
             m['decisions'] = dec
             m['differ_pct'] = 100 * (t('L2.rl-chose-other') if p == 'rl' else t('L2.sf-second-chances')) / dec if dec else 0
             m['passes'] = t('L2.rl-passes') if p == 'rl' else t('L2.sf-second-chances')
-            m['max_passes'] = max(s['L2.rl-max-passes']) if p == 'rl' and 'L2.rl-max-passes' in s else None
+            m['max_passes'] = max(s['L2.rl-max-passes']) if p == 'rl' and 'L2.rl-max-passes' in s and not region else None
             ev = t(f'L2.{p}-diag-evicted-BT') + t(f'L2.{p}-diag-evicted-AT')
             m['evicted_AT_pct'] = 100 * t(f'L2.{p}-diag-evicted-AT') / ev if ev else 0
             m['evicted_S_E_M'] = '/'.join(f'{100 * t(f"L2.{p}-diag-evicted-{c}") / ev:.0f}' if ev else '-' for c in 'SEM')
@@ -197,6 +215,7 @@ def metrics(s):
 
 def main(argv):
     outdir = argv[0]
+    region = argv[argv.index('--region') + 1] if '--region' in argv else None
     jobs = list({j['name']: j for j in (json.loads(l) for l in open(os.path.join(outdir, 'manifest.jsonl')))}.values())
     legacy = legacy_checks(outdir)
     failed, rows, used, errors = [], [], [], []
@@ -210,8 +229,12 @@ def main(argv):
             failed.append((j['name'], why))
             continue
         try:
-            m = metrics(load(j['dir']))
-        except (OSError, ValueError, KeyError) as e:
+            if j.get('measure') and region != j['measure']:
+                raise ValueError(f'the run measures {j["measure"]}: summarize it with --region {j["measure"]}')
+            if region and j.get('measure_checks') is not None and not (j['measure_checks'] and all(j['measure_checks'].values())):
+                raise ValueError(f'interval checks failed: {j["measure_checks"]}')
+            m = metrics(load(j['dir'], region), region)
+        except (OSError, ValueError, KeyError, IndexError) as e:
             failed.append((j['name'], f'unusable statistics: {e}'))
             continue
         used.append(j)
@@ -269,17 +292,17 @@ def main(argv):
     for e in errors:
         print(f'  ERROR: {e}')
     cols = ['ipc', 'time_us', 'l1d_mpki', 'l2_mpki', 'l2_miss', 'l2_inval', 'l2_dirty_evict', 'l3_miss', 'dram_rd', 'dram_wr']
-    order = ['lru', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4']
+    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4']
     for (w, l3) in sorted({(k[0], k[1]) for k in groups}):
         roi = any(r['roi'] for k, g in groups.items() if k[:2] == (w, l3) for r in g)
         js = [j for j in used if j['workload'] == w and j['l3'] == l3]
         end = roi_end(js[0]) if js else None
-        region = ('whole run' if not roi else {None: 'region of interest', 'application': 'region of interest',
+        desc = ('whole run' if not roi else {None: 'region of interest', 'application': 'region of interest',
                   'instruction-limit': 'region of interest truncated at an instruction count (fixed instructions, '
                                        'not fixed work: compare per-instruction rates, not time)',
                   'iteration-marker': 'complete marked iterations'}.get(end, end))
         inp = js[0].get('input') if js else None
-        print(f'\n== {w}, L3 {l3} KB, {region}' + (f', {inp} input' if inp else '')
+        print(f'\n== {w}, L3 {l3} KB, {desc}' + (f', interval {region}' if region else '') + (f', {inp} input' if inp else '')
               + ': mean of repetitions (spread = (max - min) / mean); change vs LRU')
         base = groups.get((w, l3, 'lru'))
         print('  ' + f'{"policy":11s}' + ''.join(f'{c:>17s}' for c in cols))
