@@ -58,6 +58,10 @@ POLICY_KEYS = ('perf_model/l2_cache/sf', 'perf_model/l2_cache/rl', 'perf_model/l
 RUN_SPECIFIC = ('output_dir', 'trace_prefix', 'script0name')
 
 
+# rl_lru settings reported in the manifest's rl_settings and printed per policy
+SETTING_KEYS = ('estimator', 'horizon', 'alpha', 'window', 'selection', 'learning', 'initial_weights')
+
+
 def is_policy_key(sec, k):
     # Subsections of the policy sections count too (rl/initial_weights/<feature>)
     return any(sec == p or sec.startswith(p + '/') for p in POLICY_KEYS) or (sec == 'perf_model/l2_cache' and k == 'replacement_policy')
@@ -239,8 +243,11 @@ def main(argv):
             failed.append((j['name'], f'unusable statistics: {e}'))
             continue
         used.append(j)
+        # The rl_lru settings the simulator reported (run_stage6.py rl_settings; not recorded before Stage 7)
+        rs = (j.get('rl_settings') or {}).get('L2', {})
+        settings = {f'set_{k}': rs.get(k) for k in SETTING_KEYS} if rs.get('policy') == 'rl_lru' else {}
         rows.append(dict(name=j['name'], workload=j['workload'], l3=j['l3'], policy=j['policy'], rep=j['rep'],
-                         roi=j.get('roi', False), wall_s=j['wall_s'], **m))
+                         roi=j.get('roi', False), wall_s=j['wall_s'], **settings, **m))
     if '--csv' in argv and rows:
         with open(argv[argv.index('--csv') + 1], 'w', newline='') as f:
             keys = list(dict.fromkeys(k for r in rows for k in r))
@@ -293,7 +300,10 @@ def main(argv):
     for e in errors:
         print(f'  ERROR: {e}')
     cols = ['ipc', 'time_us', 'l1d_mpki', 'l2_mpki', 'l2_miss', 'l2_inval', 'l2_dirty_evict', 'l3_miss', 'dram_rd', 'dram_wr']
-    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4', 'rl-n4-frozen', 'rl-n4-prio', 'rl-n4-rand']
+    # Known policies in a fixed order, then any other policy found (so no run is silently left out of the tables)
+    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4', 'rl-n4-ema001', 'rl-n4-dm65536', 'rl-n4-frozen',
+             'rl-n4-prio', 'rl-n4-rand']
+    order += sorted({k[2] for k in groups} - set(order))
     for (w, l3) in sorted({(k[0], k[1]) for k in groups}):
         roi = any(r['roi'] for k, g in groups.items() if k[:2] == (w, l3) for r in g)
         js = [j for j in used if j['workload'] == w and j['l3'] == l3]
@@ -306,12 +316,12 @@ def main(argv):
         print(f'\n== {w}, L3 {l3} KB, {desc}' + (f', interval {region}' if region else '') + (f', {inp} input' if inp else '')
               + ': mean of repetitions (spread = (max - min) / mean); change vs LRU')
         base = groups.get((w, l3, 'lru'))
-        print('  ' + f'{"policy":11s}' + ''.join(f'{c:>17s}' for c in cols))
+        print('  ' + f'{"policy":14s}' + ''.join(f'{c:>17s}' for c in cols))
         for p in order:
             g = groups.get((w, l3, p))
             if not g:
                 continue
-            line, dline = f'  {p:11s}', f'  {"":11s}'
+            line, dline = f'  {p:14s}', f'  {"":14s}'
             for c in cols:
                 v = [r[c] for r in g]
                 mean = statistics.mean(v)
@@ -333,7 +343,7 @@ def main(argv):
                 continue
             avg = lambda k: statistics.mean(r[k] for r in g if r.get(k) is not None) if any(r.get(k) is not None for r in g) else None
             td, mp = avg('tied_distinct_pct'), [r['max_passes'] for r in g if r.get('max_passes') is not None]
-            print(f'    {p:11s} decisions {avg("decisions"):9.0f}  differ-from-LRU {avg("differ_pct"):5.1f}%  '
+            print(f'    {p:14s} decisions {avg("decisions"):9.0f}  differ-from-LRU {avg("differ_pct"):5.1f}%  '
                   + (f'max-passes {max(mp):3.0f}  ' if mp else '')
                   + f'runs>=5 {avg("runs_ge5_pct"):4.1f}%  runs ending invalidated {avg("runs_end_invalidated_pct"):4.1f}%  '
                   f'pinned/dec {avg("pinned_long_per_dec"):.3f}  ' + (f'tied-distinct {td:4.1f}%  ' if td is not None else '')
@@ -345,6 +355,13 @@ def main(argv):
         print('  L2 victims (all policies): ' + ', '.join(
             f'{p} S/E/M% {groups[(w, l3, p)][0]["victim_S_E_M"]} heavy-hint {statistics.mean(r["victim_heavy_hint_pct"] for r in groups[(w, l3, p)]):.1f}%'
             for p in order if groups.get((w, l3, p))))
+        reported = {p: {tuple((k, r.get(f'set_{k}')) for k in SETTING_KEYS) for r in groups[(w, l3, p)]}
+                    for p in order if groups.get((w, l3, p)) and any(r.get('set_estimator') for r in groups[(w, l3, p)])}
+        if reported:
+            print('  rl_lru settings reported at start-up: ' + '; '.join(
+                f'{p} ' + (' '.join(f'{k}={v}' for k, v in next(iter(v_)) if v is not None) if len(v_) == 1 else 'DIFFER between runs')
+                for p, v_ in reported.items()))
+            errors += [f'{p}: runs report different rl_lru settings' for p, v_ in reported.items() if len(v_) > 1]
         print('  stale write hits: ' + ', '.join(f'{p} {sum(r["stale_writes"] for r in groups[(w, l3, p)]):.0f}'
                                                  for p in order if groups.get((w, l3, p))))
         walls = lambda p: '/'.join('%.0f' % r['wall_s'] for r in groups.get((w, l3, p), []))

@@ -3,7 +3,8 @@
 
 Usage: run_stage6.py OUTDIR --workloads sharetest-r,sharetest-u --l3 8192 --reps 2 [--jobs 5] [--timeout SECONDS]
                      [--policies lru,sf-text,sf-example,rl-n2,rl-n4] [--dry-run]
-       (also lru-hist, and the controls rl-n4-frozen, rl-n4-prio, rl-n4-rand: see POLICIES)
+       (also lru-hist, the controls rl-n4-frozen, rl-n4-prio, rl-n4-rand, and the Stage 7 configurations
+       rl-n4-dm65536, rl-n4-ema001: see POLICIES)
 
 Every simulation gets the same explicit configuration apart from the policy keys: 4-core Gainestown, private L2 as
 the only cache with the policy under test, prefetchers off, traceinput/num_runs = 1, the given shared L3 size, and
@@ -29,7 +30,10 @@ RESULT FAIL. Their output is appended to OUTDIR/checkers.txt.
 
 OUTDIR/manifest.jsonl gets one line per run, written as it finishes: name, policy, workload, l3, rep, the exact
 command line, stdin file, the git commit, the simulator and workload binary checksums, timeout, exit status,
-wall-clock seconds, timed_out, the verdict of each check, and status. Status is "ok" only if the simulator exited 0
+wall-clock seconds, timed_out, the verdict of each check, and status. It also records the policy's configured options
+(policy_options) and the rl_lru settings the simulator itself reported at start-up (rl_settings, from its [RL]
+lines: mode, window, alpha, protection, scope, control settings, estimator and horizon; estimator 'ema' when no
+STAGE7 line was printed, which is the default). Status is "ok" only if the simulator exited 0
 within the timeout, the statistics exist, no "Internal exception" was logged, for ROI workloads the region was
 entered and left, and every check passed; otherwise "FAILED" or "FAILED (checks)". summarize_stage6.py uses only
 "ok" runs.
@@ -90,6 +94,14 @@ POLICIES.update({
     'rl-n4-rand':   RL_N4_BASE + [f'{L2}/rl/learning=false', f'{L2}/rl/selection=random', f'{L2}/rl/random_rate=0.083',
                                   f'{L2}/rl/seed=1'],
 })
+# Stage 7 (docs/rl/STAGE7.md): rl-n4 with another weight estimator, learning on, zero initial weights (no LU input).
+#   rl-n4-dm65536  rl/estimator=discounted_mean, rl/horizon=65536 decisions (rl/alpha=0.1 stays in the list, unused)
+#   rl-n4-ema001   the algorithm's EMA with rl/alpha=0.01 instead of 0.1 (the smaller-alpha comparator)
+POLICIES.update({
+    'rl-n4-dm65536': RL_N4_BASE + [f'{L2}/rl/estimator=discounted_mean', f'{L2}/rl/horizon=65536'],
+    'rl-n4-ema001':  [f'{L2}/rl/alpha=0.01' if o == f'{L2}/rl/alpha=0.1' else o for o in RL_N4_BASE] + [f'{L2}/rl/estimator=ema'],
+})
+assert POLICIES['rl-n4-ema001'].count(f'{L2}/rl/alpha=0.01') == 1 and f'{L2}/rl/alpha=0.1' not in POLICIES['rl-n4-ema001']
 # Workloads: name -> command after `--`, whether to simulate the ROI only, and an optional stdin file.
 # The SPLASH-2 arguments are those of the benchmarks repository's splashrun, with 4 threads.
 S2 = lambda d, *a: [os.path.join(SPLASH2, d)] + list(a)
@@ -218,6 +230,36 @@ def session_members(sid):
     return pids
 
 
+RL_LINE_RE = re.compile(r'\[RL\] (\S+) core (\d+): (.*)$', re.M)
+
+
+def rl_settings(text):
+    """The rl_lru/sf_lru settings each cache printed at start-up ([RL] lines of the run log): {cache: {key: value}}, merged
+    over the cores when they agree (else one entry per core). rl_lru's estimator is 'ema' unless a STAGE7 line says
+    otherwise (the default prints none)."""
+    per = {}
+    for cache, core, rest in RL_LINE_RE.findall(text):
+        if 'diagnostics on' in rest:
+            continue
+        d = per.setdefault((cache, int(core)), {})
+        if rest.startswith('rl_lru') and 'policy' not in d:
+            d.update(policy='rl_lru', estimator='ema')
+        elif rest.startswith('sf_lru'):
+            d['policy'] = 'sf_lru'
+        d.update(re.findall(r'([A-Za-z_]+)=(\S+)', rest))
+        if 'initial weights' in rest:
+            d['initial_weights'] = rest.split('initial weights ', 1)[1].strip()
+        if 'stream ' in rest:
+            d['stream'] = rest.split('stream ', 1)[1].split(')', 1)[0]
+    out = {}
+    for cache in sorted({c for c, _ in per}):
+        cores = {k[1]: v for k, v in per.items() if k[0] == cache}
+        common = {k: v for k, v in cores[min(cores)].items() if k != 'stream' and all(c.get(k) == v for c in cores.values())}
+        per_core = {c: {k: v for k, v in d.items() if common.get(k) != v} for c, d in sorted(cores.items())}
+        out[cache] = dict(common, cores=sorted(cores), per_core={c: d for c, d in per_core.items() if d})
+    return out
+
+
 def run_one(job, manifest, checkers_txt):
     timeout = job['timeout_s']
     name, cmd, outdir = job['name'], job['cmd'], job['dir']
@@ -288,6 +330,7 @@ def run_one(job, manifest, checkers_txt):
         d = interval_dir(outdir, job['measure'])
         measure_checks = run_checks(d, job['policy'], checkers_txt, f' (interval {job["measure"]})') if d else {}
         checks_ok = checks_ok and bool(measure_checks) and all(measure_checks.values())
+    job.update(rl_settings=rl_settings(text))
     job.update(exit=rc, wall_s=round(wall, 1), timed_out=timed_out, crashed=crashed, stats=stats, roi_seen=roi_seen,
                roi_end=roi_end, roi_switches=switches, roi_markers=markers, measure_checks=measure_checks,
                checks=checks, status='ok' if ok and checks_ok else ('FAILED (checks)' if ok else 'FAILED'))
@@ -338,6 +381,7 @@ def main():
                     d = os.path.join(outdir, name)
                     spec = WORKLOADS[w]
                     jobs.append(dict(name=name, policy=p, workload=w, l3=int(l3), rep=rep, dir=d, cmd=command(p, w, l3, d),
+                                     policy_options=list(POLICIES[p]),
                                      roi=bool(spec.get('roi')), stdin=spec.get('stdin'),
                                      stdin_md5=md5(spec['stdin']) if spec.get('stdin') else None,
                                      workload_md5=md5(spec['cmd'][0]), workload_build=build_info(spec['cmd'][0]),

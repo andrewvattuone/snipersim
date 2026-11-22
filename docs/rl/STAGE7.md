@@ -245,8 +245,13 @@ w_f(t) = ( w0·e^(−t/H) + Σ_k e^(−(t − t_k)/H)·r_k ) / ( e^(−t/H) + Σ
   * **If it stays near rl-n4 or does worse,** the reward's verdict on S (D) is the problem, and option 5 is next.
 
 **4. Overhead.**
-* **Simulator memory:** per weight table, 5 × (2 doubles, a 64-bit time, a flag), about 120 bytes against 40 today.
-  That is one table per L2 at global scope, the default.
+* **Simulator memory, measured** (g++ 11.4, x86-64, `sizeof`):
+  * **Per table:** `WeightTable` is 200 bytes, against 40 before the change. Each of its five accumulators is 32
+    bytes: a flag padded to 8 bytes, the sum, the count and a 64-bit time.
+  * **Per cache:** +160 bytes for each L2 at global scope (the default, one table per cache). With
+    `weight_scope=per_set` and the 512 sets of the 256 KB 8-way L2, about +80 KB per L2.
+  * **Default runs carry the accumulators too,** unused; behaviour is unchanged.
+  * **`RewardConfig`** grows from 48 to 64 bytes, once per cache.
 * **Simulator time:** per reward, one `exp`, two multiply-adds and a division for each of the two rewarded features.
   This is negligible.
 * **Hardware sketch:**
@@ -304,7 +309,18 @@ w_f(t) = ( w0·e^(−t/H) + Σ_k e^(−(t − t_k)/H)·r_k ) / ( e^(−t/H) + Σ
     dispatch in `RewardPolicy::reward`;
   * `cache_set_rl.cc`: option parsing and the start-up line;
   * tests in `testing/unit/rl/test_estimator.cc`.
-* **No `run_stage6.py` policy was added:** the variant is run with the two `-g` options above.
+* **Runner policies** (`experiments/rl/run_stage6.py`), both learning from zero initial weights:
+  * `rl-n4-dm65536`: rl-n4 + `rl/estimator=discounted_mean` + `rl/horizon=65536` (`rl/alpha=0.1` stays in the list,
+    unused);
+  * `rl-n4-ema001`: rl-n4 with `rl/alpha=0.01` instead of 0.1, plus an explicit `rl/estimator=ema` (candidate 1).
+* **Recorded per run:** each manifest line records `policy_options` (the policy's configured `-g` options) and
+  `rl_settings`, the settings each L2 reported in its `[RL]` start-up lines:
+  * mode, window, alpha, protection and scope;
+  * the control settings;
+  * the estimator (`ema` when no STAGE7 line was printed) and the horizon.
+* **Summaries:** `summarize_stage6.py` lists both policies, appends any policy it does not know instead of leaving it
+  out, and prints the reported settings per policy. Runs of one policy that report different settings are a
+  consistency error.
 
 ## Verification
 
