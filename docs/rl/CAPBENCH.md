@@ -341,30 +341,201 @@ Paper inputs, 8 MB L3, first 500 M ROI instructions. These are workload characte
 7. The number of runs per configuration and how variability was handled.
 8. Whether they observed the LU pivot and IS sorting defects, and whether their copies differ.
 
-## Next two LRU qualification experiments
+## LRU qualification 2 (`results/stage6-capbench-qual2`, archived)
 
-Both are defined in `run_stage6.py`, with checks and timeouts. Each runs with `lru` and with `lru-hist`, the same
-LRU victim sequence plus the eviction history, so that reuse just beyond the L2's capacity can be measured.
+The two experiments recommended after the tooling review, each with `lru` and with `lru-hist` (the same LRU victim
+sequence plus the eviction history, so that reuse just beyond the L2's capacity can be measured). One run each; all
+checks pass.
 
-1. **`capbx-lu-tiny`** (exploratory input): LU 512 × 512, the whole factorization (ROI 0.71 G of 0.72 G
-   instructions; `application` end).
-   * **Why** (from the code, not yet measured): each core's share of the active submatrix is about (511 − i)^2
-     bytes at step i. That is about 256 kB, the L2 size, at the first step, and still ≥ 165 kB through step 105,
-     by which half the work is done. Every step re-reads it: real reuse at the L2's capacity edge.
-   * **Sharing:** each step's pivot row is read by all four cores after another core wrote it, and the row and
-     column swaps write across thread partitions.
-   * **Exploratory twice over:** a reduced input, and the upstream pivot defect above.
-   * **Expected cost:** 900-2,400 s at 0.3-0.8 MIPS; timeout 5,400 s.
-2. **`capb-km-paper-it2`** (paper input): KM `paper`, iterations 1-2 in detail (3.55 G instructions,
-   `iteration-marker` end), with a snapshot at the start of iteration 2.
-   * **Measurement:** iteration 1 warms the caches; iteration 2 (1.77 G) is measured alone
-     (`summarize_stage6.py --region iter-2-begin:roi-end`).
-   * **Why:** each core's points are 256 kB and the centroids 32 kB, so the per-iteration working set is just
-     above the 256 kB L2. LRU then evicts each point before its reuse in the next iteration.
-   * **Sharing:** the centroids are read by all cores and written under locks in `compute_centroids`.
-   * **Expected cost:** ~4,200 s at the measured 0.84 MIPS; timeout 9,000 s.
+| | KM `paper`, iteration 2 alone | LU `tiny` (exploratory), whole ROI |
+|---|---|---|
+| Measured region | `iter-2-begin:roi-end`, 1.77 G instructions | complete kernel ROI, 0.717 G instructions |
+| IPC / L1-D MPKI / L2 MPKI | 6.92 / 1.05 / 0.115 | 8.83 / 9.47 / 1.43 |
+| L2 evictions per 1,000 instructions | 0.02 | 0.85 |
+| L2 hits at LRU stack positions 4-7 (of 0-7) | 0.1% | 78.9% (17.3% at position 7) |
+| LRU misses on blocks evicted within the set's last 16 evictions | 0.019 MPKI | 0.75 MPKI |
+| L2 victims S / E / M | 1 / 93 / 6% | 9 / 1 / 89% |
+| Wall time | 5,178-5,232 s | 1,305-1,310 s |
 
-* **Together:** about 70-75 min with both in parallel.
-* **If either shows reuse** at the L2's capacity edge, a bounded five-policy pilot on it can follow.
-* **Not recommended now:** IS (wrong and timing-dependent results); LU `standard` (pure streaming); FAST (the
-  thesis reports a 99.8% L2 miss rate); FN, GF and TSP (very little memory traffic per thesis Fig. 4.1).
+* **KM** has almost no replacement pressure. Its L2 misses are mostly coherence misses; removing every capacity
+  miss would save about 0.1% of the run time. It does not justify a policy comparison.
+* **LU `tiny`** reuses data just past the L2's capacity, and evicted Shared blocks return less often (59%) than
+  Modified ones (92%). It was chosen for the five-policy pilot below.
+* **KM's iteration markers** were all seen in order (31 begin, 31 end). The deferred switches lay 0.26-1.22 M
+  instructions after their markers, under 0.07% of an iteration.
+
+## LU `tiny` five-policy pilot (`results/stage6-capbench-lu-pilot`, archived): EXPLORATORY
+
+**Exploratory:** the upstream LU pivot defect (`lower_upper.c:93`, above) makes the factorization numerically
+unreliable and may change its data-dependent memory access pattern. None of these results reproduces the paper's LU
+or stands for a correct LU. They describe this program, unchanged from upstream apart from the markers.
+
+**Setup:**
+* **Runs:** `lru`, `sf-text`, `sf-example`, `rl-n2`, `rl-n4`, three repetitions each (15 runs), 4 at a time.
+* **Machine:** 4 Gainestown cores, the policy on the private L2 only, 8 MB shared L3, prefetchers off.
+* **Workload:** `capbx-lu-tiny` (`lu.intel --class tiny --nthreads 4`), the complete kernel ROI to the end of the
+  application.
+* **Builds:** one simulator binary (md5 `192619ee…`) and one LU binary (md5 `1c8b6c6b…`) for every run.
+* **Outcome:** no crashes, timeouts or failed checks; 0 stale write hits; wall time 1,216-1,345 s per run.
+
+**Every repetition** (from `metrics-per-run.csv`):
+
+| Policy | Rep | Instructions (M) | IPC | Simulated time (µs) | L2 misses | L2 demand misses | L2 dirty evictions | L2 invalidations | L2 downgrades | Victims S / M % | Differ from LRU |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| lru | 1 | 716.42 | 8.8305 | 30,500 | 1,028,306 | 838,594 | 543,039 | 205,942 | 340,995 | 9.5 / 89.3 | – |
+| lru | 2 | 716.20 | 8.8317 | 30,487 | 1,020,087 | 832,999 | 542,491 | 201,294 | 332,008 | 9.4 / 89.4 | – |
+| lru | 3 | 716.27 | 8.8225 | 30,522 | 1,053,762 | 864,242 | 566,613 | 206,155 | 345,936 | 9.3 / 89.5 | – |
+| sf-text | 1 | 721.25 | 8.7429 | 31,013 | 1,511,217 | 1,324,649 | 1,035,495 | 200,557 | 341,798 | 5.2 / 94.3 | 93.2% |
+| sf-text | 2 | 723.16 | 8.7501 | 31,070 | 1,514,339 | 1,328,609 | 1,040,496 | 200,000 | 337,300 | 5.1 / 94.3 | 93.4% |
+| sf-text | 3 | 722.30 | 8.7455 | 31,049 | 1,513,313 | 1,324,841 | 1,030,599 | 205,082 | 348,829 | 5.2 / 94.2 | 92.9% |
+| sf-example | 1 | 720.02 | 8.6784 | 31,190 | 1,787,542 | 1,603,227 | 1,309,799 | 203,347 | 344,445 | 4.0 / 95.3 | 92.2% |
+| sf-example | 2 | 719.46 | 8.6753 | 31,178 | 1,792,691 | 1,609,978 | 1,317,813 | 201,684 | 345,089 | 4.1 / 95.3 | 92.3% |
+| sf-example | 3 | 719.28 | 8.6748 | 31,172 | 1,790,920 | 1,607,801 | 1,315,435 | 201,565 | 345,656 | 4.1 / 95.2 | 92.6% |
+| rl-n2 | 1 | 716.59 | 8.8249 | 30,526 | 1,031,168 | 847,490 | 558,434 | 197,784 | 335,752 | 9.6 / 89.3 | 6.3% |
+| rl-n2 | 2 | 714.80 | 8.8252 | 30,450 | 1,006,130 | 816,438 | 524,237 | 202,822 | 336,917 | 9.9 / 89.0 | 6.4% |
+| rl-n2 | 3 | 714.31 | 8.8222 | 30,439 | 1,001,445 | 814,641 | 525,679 | 199,562 | 334,619 | 10.0 / 89.0 | 6.4% |
+| rl-n4 | 1 | 715.73 | 8.8408 | 30,435 | 969,444 | 782,712 | 494,800 | 195,766 | 329,767 | 10.8 / 88.0 | 8.0% |
+| rl-n4 | 2 | 716.70 | 8.8355 | 30,495 | 995,106 | 812,303 | 527,004 | 190,778 | 329,845 | 10.6 / 88.3 | 8.4% |
+| rl-n4 | 3 | 715.45 | 8.8339 | 30,447 | 978,458 | 796,784 | 511,801 | 192,961 | 333,866 | 10.7 / 88.3 | 8.5% |
+
+* **L3 misses and DRAM traffic** are the same for every policy (33.4 k L3 misses, 33.4 k DRAM reads, 0 writes).
+  They are the cold misses; the 8 MB L3 holds the whole working set.
+
+**Means, change vs LRU:**
+
+| | sf-text | sf-example | rl-n2 | rl-n4 |
+|---|---|---|---|---|
+| Simulated time | +1.77% | +2.22% | −0.10% | −0.14% |
+| IPC | −0.93% | −1.72% | −0.05% | +0.10% |
+| L2 misses | +46.3% | +73.1% | −2.0% | −5.1% |
+| L2 dirty evictions | +88% | +139% | −2.7% | −7.2% |
+| L2 invalidations | −1.3% | −1.1% | −2.2% | −5.5% |
+| L2 downgrades | +0.9% | +1.6% | −1.1% | −2.5% |
+
+**Denominators** (shown on the `lru-hist` qualification run: 716.16 M instructions, 6,800,396 L2 accesses):
+* **L2 misses: 1,020,957** (1.426 MPKI) = load misses 783,887 + store misses 237,070. They fall into three kinds:
+  * **Demand misses: 833,842.** The block is absent (state I): load-I 783,887 + store-I 49,955. Only these need a
+    replacement decision, and they are the policy diagnostics' "misses" (`rl-diag-misses` = `rl-event-fill-demand`).
+  * **Upgrade misses: 186,485.** A store to a block present in S (186,465) or E (20). It is refilled in place
+    (`rl-event-fill-upgrade-refill`); no victim is chosen.
+  * **Other: 630.** Store misses recorded on blocks in M, with no fill of either kind.
+* **Eviction-history returns: 538,082.** Demand misses on a block evicted within its set's last 16 evictions
+  (`rl-diag-miss-replaced-in-history`). This equals the S/E/M sum of `reward-evict-bad`. As a share, it is:
+  * 64.5% of the 833,842 demand misses (the figure in the policy summaries);
+  * 52.7% of all 1,020,957 L2 misses;
+  * 0.751 MPKI, against 1.426 MPKI for all L2 misses;
+  * 88.5% of the 607,671 evictions;
+  * 7.9% of the L2 accesses.
+
+**Instructions, IPC and simulated time:**
+* **They agree exactly in every run.** Cycles = simulated time × 2.66 GHz, and IPC = instructions / cycles,
+  summed over the 4 cores.
+* **The instruction count is not fixed.** The ROI is the same work, but the sf rules retire 0.46-0.95% more
+  instructions than LRU (719.3-723.2 M vs 716.2-716.4 M). The rl policies are within ±0.3%.
+* **Extra instructions track extra time.** Across the 15 runs they rise with simulated time: about 0.7 extra
+  instructions per extra core-cycle, r = 0.88. The extra goes to cores 1-3, while core 0 retires slightly fewer.
+* **Likely cause: OpenMP waiting.** The run records no futex waits and spin-loop detection is off, so libgomp's
+  barrier and critical-section waits spin in user code and count as retired instructions. This is consistent with
+  the data but not proven.
+* **Consequence:** IPC includes waiting instructions, so a slower policy loses less IPC than run time (sf-text:
+  +0.83% instructions, +1.77% time, −0.93% IPC). For this fixed-work ROI, **simulated time** is the performance
+  measure; absolute miss counts are cleaner than MPKI.
+
+**Statistical evidence versus exploratory findings:**
+* **Run-to-run variability of LRU:** across its three repetitions, L2 misses vary by 3.3% of the mean (standard
+  deviation 1.7%), dirty evictions by 4.4%, simulated time by 0.11%.
+* **The sf rules are clearly worse.** Their misses, dirty evictions and time are far outside LRU's range in every
+  repetition.
+* **rl-n4 at the L2 (indicative, not established):**
+  * **Lower in every repetition:** L2 misses (−5.1%), dirty evictions (−7.2%) and invalidations (−5.5%). All
+    three rl-n4 runs fall outside LRU's three-run range.
+  * **Welch t statistics:** −4.2, −3.2 and −5.3, about 3.7 degrees of freedom.
+  * **Why this is not significance:** three repetitions, about ten metrics examined, no correction for multiple
+    comparisons, and run-to-run variation (two identical runs differ by a few instructions before the ROI) that is
+    not shown to be the only source of difference.
+* **rl-n4's performance change is not separable from noise.** Simulated time −0.14% overlaps LRU's range
+  (t ≈ −2.1); IPC +0.10% is at the edge of it.
+* **rl-n2:** every difference is within LRU's variability.
+
+**Exploratory observations (mechanism, not tested):**
+* **More Shared victims:** rl-n4 evicts more Shared blocks than LRU (10.6-10.8% vs 9.3-9.5% of victims, about
+  +4.2 k) and fewer Modified ones (about −39.5 k).
+* **Shared blocks are the better victims here.** Under every policy, evicted Shared and above-threshold blocks
+  return within the history much less often (59-64%) than Modified ones (91-96%).
+* **The learned weights point the same way.** In every rl-n4 run and core, wM is the most negative weight; wS is
+  near 0, and wAT is positive on cores 0-2 (second-half means; positive = evict more readily).
+* **Mostly LRU:** all candidates tie in 83% (rl-n4) and 88% (rl-n2) of decisions, which then go to the oldest.
+  The policies leave LRU in only 8.3% and 6.4% of decisions.
+* **The sf rules do the opposite.** sf-text and sf-example evict Modified blocks preferentially (94-95% of victims)
+  and nearly double the misses.
+* **No performance payoff here.** L3 never misses, so a saved L2 miss saves only an L3 hit, and the kernel is
+  compute-bound (IPC 8.8 on 4 cores). Even a real L2 effect cannot change the run time much on this input.
+
+**What the pilot does not show:**
+* **Learning, specifically, is not shown to help.** rl-n4 departs from LRU on 8.3% of decisions, and its learned
+  preference (Shared and above-threshold before Modified, within the 4 oldest) could come from a fixed rule.
+* **The sf rules are not that control.** They are a different, ratio-based mechanism.
+* **What can separate learning from a fixed preference:** the controls below.
+
+## Controls for the learning question (`review/stage6-controls`)
+
+`rl_lru` options that keep rl-n4's window, candidates, eligibility, history and diagnostics, and change only how
+the victim is chosen among the 4 oldest eligible candidates. Implementation, tests and defaults:
+[`POLICY_CORES.md`](POLICY_CORES.md#controls-for-the-learning-question).
+
+| Control | `run_stage6.py` policy | Victim among the 4 oldest | Weight updates |
+|---|---|---|---|
+| Frozen weights | `rl-n4-frozen` | highest score under a fixed, recorded weight vector | none |
+| Fixed priority | `rl-n4-prio` | S before E before M; above-threshold first within a state; then the oldest | none (weights unused) |
+| Randomized | `rl-n4-rand` | the oldest, or with probability 0.083 a uniformly drawn other one (seeded) | none (weights unused) |
+
+* **Frozen weights:**
+  * **Source of the vector:** wS −0.09, wE −0.38, wM −0.76, wBT −0.64, wAT 0.00. It is the mean of the
+    second-half (in-ROI) weight snapshots of the 12 core-runs of the rl-n4 pilot above.
+  * **Not an independent test:** the vector comes from this workload, so it is an in-sample control. It asks
+    whether continuing to update the weights adds anything to their average, not whether learned weights
+    transfer.
+  * **Core 3 differs:** it learned wAT −0.39 to −0.46 in all three runs, against +0.03 to +0.26 on cores 0-2.
+    The pooled vector, applied to every core, does not follow that.
+* **Fixed priority:** a hypothesis stated before seeing a comparison, not fitted. It is deterministic, with no
+  learning.
+* **Randomized:**
+  * **Rate:** the probability equals rl-n4's measured rate of departing from LRU (8.3%). The run reports its own
+    actual rate (`rl-chose-other` / `rl-decisions`), which is slightly lower: with a single eligible candidate,
+    nothing is drawn.
+  * **What it controls for:** a non-LRU perturbation at the same rate but uninformed by MESI state or sharing.
+    It does not mimic *where* rl-n4's departures happen.
+
+## Proposed ablation (not run)
+
+* **Policies:** `lru`, `rl-n4`, `rl-n4-frozen`, `rl-n4-prio`, `rl-n4-rand` on `capbx-lu-tiny`.
+* **Setup:** the pilot's configuration, input and ROI. Every policy runs on one new simulator build from
+  `review/stage6-controls`, including LRU and rl-n4, so that the comparison does not mix binaries.
+* **Initial size:** two repetitions (10 runs), about 1,250 s each.
+  * At 4 in parallel: three rounds, about 65-70 min.
+  * At 5 in parallel, if the machine allows: two rounds, about 45 min.
+* **Readout:**
+  * **Cache level:** L2 misses and demand misses, dirty evictions, invalidations, the Shared share of victims,
+    the history-return rates by class, and the rate of departing from LRU.
+  * **Simulated time:** reported but not expected to move on this input.
+  * **Comparisons:** each control is compared with both LRU and rl-n4, against LRU's three-run spread from the
+    pilot (3.3% in L2 misses).
+* **Interpretation:**
+  * **rl-n4 ≈ `rl-n4-prio` (or ≈ `rl-n4-frozen`), both better than LRU:** the gain comes from a fixed preference
+    for evicting Shared blocks, not from online learning.
+  * **rl-n4 clearly better than both:** adaptation within the run adds something (more repetitions would then be
+    needed to show it).
+  * **`rl-n4-rand` ≈ rl-n4:** the effect is any perturbation of LRU, not a coherence-aware choice.
+  * **All within LRU's spread:** the pilot's −5% was not robust.
+* **Independent confirmation, later:**
+  * **A corrected LU variant.** The minimal fix is in `lower_upper.c` (`>` instead of `<` in the pivot search,
+    and the parenthesis at line 93), built as a separate, labelled variant; the factorization must then be checked
+    natively.
+  * **Or Ocean `small`** (SPLASH-2, validated in Pilot 3; correct output, no known defect).
+    * **Reuse near the L2's capacity edge:** 72.6% of LRU's L2 hits are at stack positions 4-7, and rl-n4's
+      eviction-history returns are 9.6 MPKI.
+    * **rl-n4 there:** −0.85% L2 misses, within noise.
+    * **Cost:** about 1,550 s per run.
+    * **What it would show:** the same five-policy ablation on it would test whether any control ranking seen on
+      LU carries over to a correct program.
+  * **The corrected LU variant is not implemented yet.**

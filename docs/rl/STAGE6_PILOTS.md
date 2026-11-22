@@ -517,4 +517,5 @@ before any 1 MB L3 runs.
   [`CAPBENCH.md`](CAPBENCH.md).
 * **Not planned:** more repetitions of the Ocean/Barnes matrix. The differences are at the noise level and
   are limited by what the workloads expose, not by the number of samples.
-* **Needed before any claim about learning:** the no-learning controls listed in Pilot 3.
+* **Needed before any claim about learning:** the no-learning controls listed in Pilot 3. They are now implemented
+  for review, and the CAP Bench LU `tiny` pilot that motivated them is in [`CAPBENCH.md`](CAPBENCH.md).
