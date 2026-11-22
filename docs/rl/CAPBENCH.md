@@ -505,6 +505,15 @@ the victim is chosen among the 4 oldest eligible candidates. Implementation, tes
     nothing is drawn.
   * **What it controls for:** a non-LRU perturbation at the same rate but uninformed by MESI state or sharing.
     It does not mimic *where* rl-n4's departures happen.
+* **Status:** implemented and tested, not yet run on LU `tiny`.
+  * **Tests:** 12 unit-test cases, plus a byte-identical differential test of 608 core configurations against
+    51c74b99.
+  * **Replays:** deterministic replays show the existing policies unchanged on the new build. They also show the
+    random control repeating exactly with the same seed.
+  * **Smoke run:** a 4-core smoke run of all three passed every checker.
+  * **Details:** POLICY_CORES.md.
+* **Reading frozen weights:** the summaries show `rl-weight-*-ppm` as end − begin, i.e. 0 for a frozen weight.
+  Read the vector from the start-up CONTROL line or the weight snapshots.
 
 ## Proposed ablation (not run)
 

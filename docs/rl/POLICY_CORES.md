@@ -26,7 +26,7 @@ new into Sniper; names are prefixed because every directory under `common/` is o
 | `rl_eviction_history.h` | `EvictionHistory`: per-set history shared by both cores |
 | `rl_lru_order.h` | `LruOrder`: candidate generation with Sniper `CacheSetLRU`'s exact rank semantics |
 | `rl_paper_policy.h` | `PaperPolicy`: ratio weights, rule text/example, AND/OR, next attempt |
-| `rl_reward_policy.h` | `RewardPolicy`: `WeightTable`, EMA rewards, highest-score-among-N, protection feedback |
+| `rl_reward_policy.h` | `RewardPolicy`: `WeightTable`, EMA rewards, highest-score-among-N, protection feedback; the experimental controls (`Selection`, `priority_rank`, `random_draw`, see [Controls](#controls-for-the-learning-question)) |
 | `rl_diagnostics.h` | Stage 4 observers `RewardObserver`, `PaperObserver` (read-only, see [Diagnostics](#diagnostics-stage-4)) |
 
 Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build):
@@ -41,7 +41,9 @@ Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build)
 | `test_scenarios.cc` | End-to-end deterministic scenarios |
 | `test_event_order.cc` | Regression tests for the order of events on a miss (history lookup before the eviction) |
 | `test_diagnostics.cc` | Stage 4 observers: no decision changes, totals equal the cores' counters, runs, ties, double rewards |
-| `Makefile`, `.gitignore` | Build/run; the test binary is ignored |
+| `test_controls.cc` | Experimental controls: defaults, initial and frozen weights, priority order and ties, window and eligibility, seeded random draws, diagnostics |
+| `diff_cores.cc` | Differential check against another tree's cores (`make diff-cores OLD=<tree>`), not part of `test` |
+| `Makefile`, `.gitignore` | Build/run; the test and diff binaries and outputs are ignored |
 
 ## Running the tests
 
@@ -49,9 +51,10 @@ Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build)
 make -C testing/unit/rl test          # build with -std=c++20 -Wall -Wextra -Wcast-align -Wshadow -Wconversion -Werror, run
 testing/unit/rl/rl_unit_tests paper    # only test cases whose name contains "paper"
 make -C testing/unit/rl clean
+make -C testing/unit/rl diff-cores OLD=/path/to/other/snipersim   # same traces through both trees' cores, byte compare
 ```
 
-Expected: `71 test cases, 0 failed, 844 assertions`.
+Expected: `83 test cases, 0 failed, 32347 assertions`; `diff-cores` against 51c74b99: `identical, 608 configurations`.
 
 ## Architecture
 
@@ -360,6 +363,96 @@ Unset keys take the defaults above, the approved Stage 1 settings. An unrecogniz
 configuration error. Each cache prints its effective configuration at start-up, for example
 `[RL] L2 core 0: rl_lru mode=both window=4 alpha=0.1 protect_feedback=1 weight_scope=global history=16/set threshold=>2 of 4 cores`.
 Keys given with `-g` or in a `.cfg` file are also recorded in `sim.cfg`. Experiments should set them explicitly.
+
+#### Controls for the learning question
+
+Experimental `rl_lru` options (Stage 6, review branch `review/stage6-controls`). They exist to test whether a result
+comes from learning or from a simpler fixed preference ([`CAPBENCH.md`](CAPBENCH.md), LU `tiny` pilot). Their
+defaults leave the algorithm unchanged.
+
+```
+-g perf_model/l2_cache/rl/selection=learned     # learned | priority | random                 (default learned)
+-g perf_model/l2_cache/rl/learning=true         # false: rewards counted, weights never change (default true)
+-g perf_model/l2_cache/rl/initial_weights/S=0   # also E, M, BT, AT; each in [-1, 1]          (default 0)
+-g perf_model/l2_cache/rl/random_rate=0         # selection=random only, in [0, 1]            (default 0)
+-g perf_model/l2_cache/rl/seed=0                # selection=random only, >= 0                 (default 0)
+```
+
+* **What stays the same:** every selection sees the same candidates (the eligible ways, oldest first, so never a
+  `SHARED_UPGRADING` way) and the same window N. Each also keeps the same eviction history, protection marking and
+  reward and diagnostic counters, so the policy statistics stay comparable.
+* **`learned`:** the algorithm. The highest weight score among the N oldest wins; ties go to the older candidate.
+* **`learning=false`:** every reward is still counted (`rl-reward-*`), but `WeightTable::reward` is skipped, so
+  the weights stay bit-identical to their initial values. With `initial_weights` this gives a frozen-weight policy.
+* **`priority`:** a fixed rank replaces the score (`priority_rank`).
+  * **Order, with mode both:** S/above 5 > S/below 4 > E/above 3 > E/below 2 > M/above 1 > M/below 0. A block in
+    state I (no information) ranks with E. Each part counts only if the mode uses that feature group.
+  * **Ties** go to the older candidate. The weights are not used.
+* **`random`:** the oldest candidate, unless a draw u < `random_rate`; then one of the other N−1 candidates,
+  uniformly (`random_draw`).
+  * **The draw:** SplitMix64 of the seed and the decision number, so no generator state and no standard-library
+    distribution is involved.
+  * **Seeds:** each cache's stream is `splitmix64(seed ^ core_id << 32)`, printed at start-up.
+  * **Reproducibility:** a deterministic replay repeats every decision. In a live multi-threaded run, which block
+    the k-th decision concerns varies from run to run, as for every policy.
+  * **Rate:** the realised departure rate is `rl-chose-other / rl-decisions`. It is slightly below `random_rate`
+    when a set has fewer than two eligible candidates, because nothing is drawn then.
+* **Start-up line:** a cache using any of these options prints a second line,
+  `[RL] L2 core 0: rl_lru CONTROL selection=... learning=... random_rate=... seed=... (stream ...) initial weights ...`.
+  Default runs print exactly what they printed before.
+* **Diagnostics:** `rl-diag-all-tied` and its relatives count ties on the value the selection maximises:
+  * the weight score for `learned`;
+  * the rank for `priority`;
+  * nothing to compare for `random`, so every decision counts as all tied.
+
+  The weight-order flips still describe the weights.
+* **Weight statistics:** `rl-weight-*-ppm` are recorded at every statistics snapshot, but `dumpstats` (and so the
+  summaries) shows them as end − begin differences, which are 0 for a constant weight. Read frozen weights from the
+  start-up line, the weight snapshots (`telemetry/rl-snapshots-*.csv`), or the raw `roi-end` value.
+* **Policies in `run_stage6.py`:** `rl-n4-frozen`, `rl-n4-prio` and `rl-n4-rand` (rate 0.083, seed 1). Each is
+  rl-n4 plus `learning=false` and its selection. `rl-n4-frozen`'s vector (S −0.09, E −0.38, M −0.76, BT −0.64,
+  AT 0) comes from the LU `tiny` pilot, so it is in-sample for that workload.
+
+**Verification** (commit f4383d3a, simulator build md5 `deafea4e…`):
+* **Unit tests:** `test_controls.cc`, 12 cases.
+  * **Defaults and parsing.**
+  * **Initial weights** are used from the first decision; with learning on they then move.
+  * **Learning off:** weights stay bit-identical while every reward kind is counted.
+  * **Frozen weights** choose exactly as the learned selection does with the same table.
+  * **Priority:** the order, ties to the older candidate, only the first N count, the weights are ignored.
+  * **Eligibility:** an ineligible LRU way is never chosen, and the window is the N oldest *eligible* ways.
+  * **Random draws:** rate 0 is LRU; rate 1 never takes the oldest; window 1 draws nothing; the rate is within 4
+    standard errors over 200,000 draws; positions 1-3 are uniform; seeds differ; repeated runs are identical;
+    `choose()` alone advances nothing.
+  * **Mode off, single candidates** and **tie diagnostics.**
+* **Differential test** (`make diff-cores OLD=<51c74b99 tree>`): 576 `rl_lru` and 32 `sf_lru` configurations.
+  * **Configurations:** all modes; N 1/2/4/8; alpha 0/0.1/0.5; protection on and off; both scopes; 3 seeds.
+  * **Traces:** pseudo-random, with S/E/M states, sharer hints, hits, coherence and back invalidations, and
+    upgrades.
+  * **Result:** byte-identical output, i.e. the same victim-sequence hash, core statistics, weights to 17 digits
+    and diagnostics.
+* **Simulator replays,** single core, deterministic: the 200 M-instruction LU `tiny` trace and the Stage 2 FFT
+  trace.
+  * **Existing policies:** the validated binary (`192619ee…`) and the new build gave identical statistics for
+    `lru`, `lru-hist`, `sf-text`, `sf-example`, `rl-n2` and `rl-n4`. That covers 3,979-4,090 statistics per run,
+    including `rl-event-insert-hash`, with only host wall-clock times differing.
+  * **Controls:** all three ran on both traces.
+    * `rl-n4-rand` with seed 1 twice gave identical runs; seed 2 gave a different one.
+    * Realised departure rates: 8.29% (LU, 1.76 M decisions) and 8.10% (FFT, 54 k).
+  * **Checkers:** every checker passed on all 22 new-build replays.
+  * **A single core has no S or above-threshold blocks.** There, `rl-n4-frozen` and `rl-n4-prio` both reduce to
+    "evict E before M" and gave identical decisions, as expected.
+* **Live 4-core smoke** (`capbx-lu-tiny-smoke`, LU steps 2-4):
+  * all three controls ran with all checkers passing, on the full region and on the measured interval;
+  * the CONTROL line was printed on every core, and all 511 markers were seen in order;
+  * `rl-n4-prio` evicted Shared blocks at 10.1% of victims, against 3.7-4.2% for the other two. That window is
+    far too short to compare policies.
+* **Not possible here:** a deterministic *multi-core* check of identical decisions. Live 4-core runs are not
+  repeatable, even for `sharetest` and with the validated binary. Replaying four copies of a trace gives
+  independent address spaces (almost no sharing) and is not repeatable either. Multi-core coverage of the shared
+  code therefore rests on the differential test, whose traces include every state, the sharing feature and every
+  coherence event.
+
 
 **Architecture.**
 
