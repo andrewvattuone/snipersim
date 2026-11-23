@@ -379,8 +379,7 @@ class Shadow:
         rec = self.tr.rec
         stop = len(rec) if stop is None else stop
         evicted = None  # recorded decision waiting for its fill record
-        for i in range(start, stop):
-            t, c, a, b, aux, tag = rec[i]
+        for i, (t, c, a, b, aux, tag) in enumerate(rec.iter(start, stop), start):
             if t == R.T_ACCESS:
                 if a & R.ACC_PREFETCH:
                     continue

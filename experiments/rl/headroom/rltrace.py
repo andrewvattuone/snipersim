@@ -47,20 +47,49 @@ def encode(records):
     return b''.join(RECORD.pack(*r) for r in records)
 
 
+class Records:
+    """The records of a trace as a read-only sequence of (type, core, a, b, aux, tag) tuples, unpacked on access from
+    the (memory-mapped) bytes: memory stays at the page cache, whatever the trace's length."""
+
+    def __init__(self, buf):
+        self.buf = buf
+        self.n = len(buf) // RECORD.size
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            start, stop, step = i.indices(self.n)
+            if step != 1:
+                raise ValueError('record slices must be contiguous')
+            return list(self.iter(start, stop))
+        if i < 0:
+            i += self.n
+        if not 0 <= i < self.n:
+            raise IndexError(i)
+        return RECORD.unpack_from(self.buf, i * RECORD.size)
+
+    def __iter__(self):
+        return self.iter(0, self.n)
+
+    def iter(self, start, stop):
+        return RECORD.iter_unpack(memoryview(self.buf)[start * RECORD.size:max(start, stop) * RECORD.size])
+
+
 class Trace:
-    """A trace: its records (a list of (type, core, a, b, aux, tag) tuples), geometry, sampling and sidecar."""
+    """A trace: its records (Records), geometry, sampling and sidecar."""
 
     def __init__(self, path=None, data=None):
         if data is None:
             self.path = os.path.abspath(path)
             with open(self.path, 'rb') as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
-                    data = m[:]
+                data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) if os.path.getsize(self.path) else b''
         else:
             self.path = path or '<memory>'
         if len(data) % RECORD.size:
             raise TraceError(f'{self.path}: size is not a multiple of {RECORD.size} bytes')
-        self.rec = list(RECORD.iter_unpack(data))
+        self.rec = Records(data)
         r = self.rec
         if len(r) < 3 or r[0][0] != T_HEADER or r[0][5] != MAGIC:
             raise TraceError(f'{self.path}: not an rl-trace file (bad magic)')
@@ -89,8 +118,10 @@ class Trace:
     def roi(self):
         """(begin, end) record indices of the region of interest: after the first ROI-begin marker, before the last
         ROI-end marker; the whole trace if there are no markers."""
-        begins = [i for i, x in enumerate(self.rec) if x[0] == T_ROI and x[2] == 1]
-        ends = [i for i, x in enumerate(self.rec) if x[0] == T_ROI and x[2] == 0]
+        begins, ends = [], []
+        for i, x in enumerate(self.rec):
+            if x[0] == T_ROI:
+                (begins if x[2] == 1 else ends).append(i)
         if not begins and not ends:
             return 0, len(self.rec)
         return (begins[0] if begins else 0), (ends[-1] if ends else len(self.rec))
@@ -163,7 +194,7 @@ def trace_tallies(tr, start=None, stop=None):
             'fill_demand', 'fill_upgrade', 'decisions',
             'inv_unclassified', 'inv_coherence', 'inv_back-invalidation', 'inv_upgrade', 'l1')
     out = {c: dict.fromkeys(keys, 0) for c in range(tr.cores)}
-    for t, c, a, bb, aux, tag in tr.rec[start:stop]:
+    for t, c, a, bb, aux, tag in tr.rec.iter(start, stop):
         o = out[c]
         if t == T_ACCESS:
             if a & ACC_PREFETCH:

@@ -76,6 +76,10 @@ def cmd_check(args):
         print(f'   records {len(tr)} {tr.counts()}')
         print(f'   cores {tr.cores} sets {tr.sets} ways {tr.ways} line {1 << tr.log_block} B; sampled sets: s % {tr.modulus} == {tr.residue} '
               f'({len(tr.sampled_sets())} per cache); ROI records {tr.roi()}; complete {tr.complete}')
+        b, _ = tr.roi()
+        pre = sum(1 for x in tr.rec[2:b] if x[0] in (R.T_ACCESS, R.T_DECISION, R.T_FILL, R.T_INVAL))
+        print(f'   cache records before the ROI {pre}' + ('' if not pre else ' (warm-up reached the traced cache: a shadow replays it from the '
+                                                         'trace start, so check that the self-replay is exact)'))
         if tr.sidecar:
             print(f"   sidecar checks {tr.sidecar.get('checks')} l1 filter {tr.sidecar.get('l1_filter')}")
             ok_all &= all(v == 0 for v in tr.sidecar.get('checks', {}).values())
@@ -198,14 +202,34 @@ def cmd_calibrate(args):
     for k in rL:
         print(f'   {k:24s} {rL[k]:10d} {pPL[k]:10d} {rP[k]:10d} {pct(pPL[k], rP[k]):+8.2f} | {pLP[k]:10d} {pct(pLP[k], rL[k]):+8.2f}')
 
+    # Noise floor: two runs of one policy (multi-threaded runs differ); the measured difference between them is what a
+    # perfect model could not predict either. Each null pair must be two traced runs of the same policy.
+    noise = []
+    print('== 4. noise floor (null pairs: two runs of one policy)')
+    for spec in args.null or []:
+        a, b = spec.split(':', 1)
+        ta, tb = load(a), load(b)
+        ma, mb = recorded_misses(ta)[0], recorded_misses(tb)[0]
+        ns, na = pct(mb, ma), pct(stats_misses(b), stats_misses(a))
+        noise.append(abs(ns))
+        print(f'   {a} vs {b}: sampled sets {ns:+.3f}%  all sets {na:+.3f}%')
     thr = args.threshold
     eL, eP = errs['full model']
-    passed = exact and abs(eL) <= thr and abs(eP) <= thr
+    represent = abs(meas_s - meas_all) <= thr
+    if not noise:
+        verdict = 'INCONCLUSIVE (no null pair: the noise floor is unknown)'
+    elif max(noise) > thr / 2:
+        verdict = f'INCONCLUSIVE (noise floor {max(noise):.3f} points > half the threshold: more sets or repetitions needed)'
+    elif not exact or not represent or abs(eL) > thr or abs(eP) > thr:
+        verdict = 'FAIL'
+    else:
+        verdict = 'PASS'
     print(f'== RESULT: self-replays {"exact" if exact else "NOT exact"}; prediction errors {eL:+.3f} / {eP:+.3f} points (threshold ±{thr}); '
-          f'sampling difference {meas_s - meas_all:+.3f} points -> CALIBRATION {"PASS" if passed else "FAIL"}')
-    if not passed:
+          f'sampling difference {meas_s - meas_all:+.3f} points; noise floor {max(noise) if noise else float("nan"):.3f} points '
+          f'-> CALIBRATION {verdict}')
+    if verdict != 'PASS':
         print('   The shadow model must not be used to rank replacement preferences (docs/rl/HEADROOM.md, "If calibration fails").')
-    return 0 if passed else 1
+    return 0 if verdict == 'PASS' else 1
 
 
 def cmd_orders(args):
@@ -265,6 +289,7 @@ def main(argv=None):
     p.add_argument('--window', type=int, default=4)
     p.add_argument('--threshold', type=float, default=0.5, help='points of the priority-vs-LRU miss difference (default 0.5)')
     p.add_argument('--reference', action='append', help='POLICY=RUN: an untraced run whose all-set misses are listed for context')
+    p.add_argument('--null', action='append', help='RUN_A:RUN_B: two traced runs of one policy (noise floor); required for a PASS')
     p = sub.add_parser('orders')
     p.add_argument('run')
     p.add_argument('--all', action='store_true', help='all 720 orders (default: the 60 additive ones)')
