@@ -1,5 +1,6 @@
 #include "simulator.h"
 #include "cache.h"
+#include "rl_trace.h"
 #include "log.h"
 #include "stats.h"
 #include "config.hpp"
@@ -145,6 +146,9 @@ Cache::Cache(
 	m_page_walk_cacheblocks.clear();
 	m_is_tlb = is_tlb;
 
+	// Headroom-diagnostic trace: observation only, off unless cfgname/rl_trace/enabled (rl_trace.h)
+	m_rl_trace = !is_tlb && RlTrace::configure(cfgname, name, core_id, m_num_sets, m_associativity, m_blocksize, hash, replacement_policy);
+
 	m_rl_event_check = NULL;
 	if (!is_tlb && getenv("SNIPER_RL_EVENT_CHECK") != NULL)
 	{
@@ -243,6 +247,15 @@ Cache::getSetLock(IntPtr addr)
 	return m_sets[set_index]->getLock();
 }
 
+void Cache::rlTraceAccess(IntPtr addr, Core::mem_op_t op, bool hit, CacheState::cstate_t pre, bool from_l1i, bool prefetch, bool overlap)
+{
+	IntPtr tag;
+	UInt32 set_index;
+	splitAddress(addr, tag, set_index);
+	if (RlTrace::sampled(set_index))
+		RlTrace::access(m_core_id, set_index, *m_sets[set_index], tag, op == Core::WRITE, op == Core::READ_EX, hit, pre, from_l1i, prefetch, overlap);
+}
+
 bool Cache::invalidateSingleLine(IntPtr addr, CacheSetEvent::invalidation_t reason)
 {
 	IntPtr tag;
@@ -260,6 +273,8 @@ bool Cache::invalidateSingleLine(IntPtr addr, CacheSetEvent::invalidation_t reas
 	}
 
 	IntPtr checked_tag = tag;
+	if (m_rl_trace && RlTrace::sampled(set_index))
+		RlTrace::beforeInvalidate(m_core_id, set_index, *m_sets[set_index], tag, reason);
 	result = m_sets[set_index]->invalidate(tag, reason);
 	if (m_rl_event_check && result)
 		rlCheckInvalidate(set_index, checked_tag, reason);
@@ -407,8 +422,14 @@ void Cache::insertSingleLine(IntPtr addr, Byte *fill_buff,
 	}
 	else
 	{
+		const bool traced = m_rl_trace && RlTrace::sampled(set_index);
+		RlTrace::InsertView trace_view;
+		if (traced)
+			trace_view = RlTrace::beforeInsert(m_core_id, set_index, *m_sets[set_index]);
 		m_sets[set_index]->insert(cache_block_info, fill_buff,
 								  eviction, evict_block_info, evict_buff, cntlr, fill);
+		if (traced)
+			RlTrace::afterInsert(m_core_id, set_index, *m_sets[set_index], trace_view, tag, fill, *eviction, evict_block_info->getTag());
 		if (m_rl_event_check)
 			rlCheckInsert(set_index, tag, fill, *eviction, evict_block_info);
 	}

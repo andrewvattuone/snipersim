@@ -13,7 +13,7 @@ CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++20 -Wall -Wextra -Wcast-align -Wshadow -Wconversion -Werror -I$(CORE_DIR) -I.
 
 SRCS := test_main.cc test_common.cc test_paper_policy.cc test_reward_policy.cc test_scenarios.cc test_event_order.cc test_diagnostics.cc \
-        test_controls.cc test_estimator.cc
+        test_controls.cc test_estimator.cc test_trace.cc
 HDRS := $(wildcard $(CORE_DIR)/*.h) rl_test.h rl_set_model.h
 BIN := rl_unit_tests
 

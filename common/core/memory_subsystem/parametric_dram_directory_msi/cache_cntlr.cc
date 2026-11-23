@@ -215,6 +215,7 @@
 #include "cache_atd.h"
 #include "shmem_perf.h"
 #include "rl_write_oracle.h"
+#include "rl_trace.h"
 #include <cstring>
 #include <algorithm>
 
@@ -1521,6 +1522,17 @@ namespace ParametricDramDirectoryMSI
 			if (isPrefetch == Prefetch::NONE)
 				getCache()->updateCounters(cache_hit);
 			updateCounters(mem_op_type, address, cache_hit, getCacheState(address), block_type, isPrefetch);
+			// Headroom-diagnostic trace (rl_trace.h, off by default): the counted access; observation only. `overlap` is
+			// updateCounters' test (the line's fill still in flight), read without changing the MSHR maps.
+			if (getCache()->rlTraced())
+			{
+				const SubsecondTime t_now = getShmemPerfModel()->getElapsedTime(ShmemPerfModel::_USER_THREAD);
+				const auto &mshrs = metadata_request ? m_master->metadata_mshr : m_master->mshr;
+				const auto it = mshrs.find(address);
+				const bool overlap = it != mshrs.end() && it->second.t_issue < t_now && it->second.t_complete > t_now;
+				getCache()->rlTraceAccess(address, mem_op_type, cache_hit, getCacheState(address),
+					requester && requester->m_mem_component == MemComponent::L1_ICACHE, isPrefetch != Prefetch::NONE, overlap);
+			}
 		}
 
 		if (cache_hit)
@@ -2128,6 +2140,11 @@ namespace ParametricDramDirectoryMSI
 			LOG_PRINT_ERROR("Unsupported Mem Op Type: %u", mem_op_type);
 			break;
 		}
+
+		// Headroom-diagnostic trace (rl_trace.h, off by default): the L1 access, for its inclusion and coherence filters;
+		// observation only. Writes and exclusive reads (READ_EX) both take exclusive ownership.
+		if (RlTrace::enabled() && (m_mem_component == MemComponent::L1_DCACHE || m_mem_component == MemComponent::L1_ICACHE))
+			RlTrace::noteL1Access(ca_address, m_core_id, m_mem_component == MemComponent::L1_DCACHE, mem_op_type != Core::READ);
 	}
 
 	/*****************************************************************************

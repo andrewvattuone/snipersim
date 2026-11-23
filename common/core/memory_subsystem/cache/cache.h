@@ -110,6 +110,8 @@ private:
 		Lock lock;
 	};
 	RlEventCheck *m_rl_event_check;
+	// Headroom-diagnostic trace (rl_trace.h, cfgname/rl_trace/enabled, off by default): this cache is traced
+	bool m_rl_trace;
 	void rlCheckInsert(UInt32 set_index, IntPtr tag, CacheSetEvent::fill_t fill, bool eviction, const CacheBlockInfo *victim);
 	void rlCheckInvalidate(UInt32 set_index, IntPtr tag, CacheSetEvent::invalidation_t reason);
 
@@ -130,6 +132,11 @@ public:
 	~Cache();
 
 	Lock &getSetLock(IntPtr addr);
+
+	// Headroom-diagnostic trace (rl_trace.h): a counted access of this cache, from the controller's counter update.
+	// Observation only; a no-op unless this cache is traced and the line's set is sampled.
+	bool rlTraced() const { return m_rl_trace; }
+	void rlTraceAccess(IntPtr addr, Core::mem_op_t op, bool hit, CacheState::cstate_t pre, bool from_l1i, bool prefetch, bool overlap);
 
 	bool invalidateSingleLine(IntPtr addr, CacheSetEvent::invalidation_t reason = CacheSetEvent::INV_UNCLASSIFIED);
 	bool invalidateSingleLineTLB(IntPtr addr, int page_size);
