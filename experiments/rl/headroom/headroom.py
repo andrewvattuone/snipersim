@@ -104,8 +104,11 @@ def print_summary(sh, rec_misses=None):
             'victim_same_pct', 'inclusion_victims', 'phantom_accesses', 'phantom_misses', 'suppressed_accesses', 'inv_modelled',
             'inv_deferred', 'inv_recorded_coherence', 'inv_recorded_back', 'downgrades_modelled', 'modelled_candidate_pct',
             'fills_at_access', 'l1_orphans', 'pending_unresolved', 'recorded_ineligible_decisions', 'fill_of_held_line')
+    if x['model_permissions']:
+        keys += S.Shadow.PERM_COUNTERS
     rel = f' ({pct(x["misses"], rec_misses):+.3f}% vs recorded)' if rec_misses else ''
-    print(f'   {x["policy"]} window {x["window"]} inclusion-model {int(x["model_inclusion"])} coherence-model {int(x["model_coherence"])}{rel}')
+    print(f'   {x["policy"]} window {x["window"]} inclusion-model {int(x["model_inclusion"])} coherence-model {int(x["model_coherence"])} '
+          f'permission-model {int(x["model_permissions"])}{rel}')
     print('     ' + '  '.join(f'{k} {x[k]:.2f}' if isinstance(x[k], float) else f'{k} {x[k]}' for k in keys))
 
 
@@ -117,7 +120,7 @@ def cmd_replay(args):
     fut = S.Future(tr) if any(p.startswith('opt') for p in args.policy) else None
     for p in args.policy:
         sh = S.replay(tr, p, window=args.window, future=fut, model_inclusion=not args.no_inclusion_model,
-                      model_coherence=not args.no_coherence_model)
+                      model_coherence=not args.no_coherence_model, model_permissions=args.model_permissions)
         print_summary(sh, rec)
     return 0
 
@@ -142,13 +145,16 @@ def cmd_calibrate(args):
             return 2
     mL, talL = recorded_misses(trL)
     mP, talP = recorded_misses(trP)
-    selfL = S.replay(trL, 'lru', window=args.window)
-    selfP = S.replay(trP, 'priority', window=args.window)
+    mp = dict(model_permissions=args.model_permissions)
+    if args.model_permissions:
+        print('== model: permission model on (docs/rl/HEADROOM.md 7.7)')
+    selfL = S.replay(trL, 'lru', window=args.window, **mp)
+    selfP = S.replay(trP, 'priority', window=args.window, **mp)
     variants = (('full model', {}), ('no inclusion model', dict(model_inclusion=False)),
                 ('no coherence model', dict(model_coherence=False)),
                 ('neither', dict(model_inclusion=False, model_coherence=False)))
-    crossPL = [(n, S.replay(trL, 'priority', window=args.window, **kw)) for n, kw in variants]
-    crossLP = [(n, S.replay(trP, 'lru', window=args.window, **kw)) for n, kw in variants]
+    crossPL = [(n, S.replay(trL, 'priority', window=args.window, **kw, **mp)) for n, kw in variants]
+    crossLP = [(n, S.replay(trP, 'lru', window=args.window, **kw, **mp)) for n, kw in variants]
 
     print('== recorded runs (sampled sets, ROI)')
     print(f'   LRU      misses {mL}   all sets (sim.stats) {stats_misses(args.lru):.0f}')
@@ -166,7 +172,8 @@ def cmd_calibrate(args):
     print('== 1. self-replays (must be exact: same misses and victims as recorded)')
     print_summary(selfL, mL)
     print_summary(selfP, mP)
-    exact = (selfL.misses() == mL and selfP.misses() == mP and selfL.n['victim_differs'] == 0 and selfP.n['victim_differs'] == 0)
+    exact = (selfL.misses() == mL and selfP.misses() == mP and selfL.n['victim_differs'] == 0 and selfP.n['victim_differs'] == 0
+             and all(sh.n[k] == 0 for sh in (selfL, selfP) for k in (S.Shadow.PERM_SELF_ZERO if args.model_permissions else ())))
     print(f'   self-replays {"EXACT" if exact else "NOT EXACT"}')
 
     print('== 2. cross-replays (predicted priority vs LRU, in points of the LRU misses)')
@@ -224,11 +231,16 @@ def cmd_calibrate(args):
         verdict = 'FAIL'
     else:
         verdict = 'PASS'
+    if args.development_data:
+        # traces used to develop the model: a check of the development, never its calibration
+        verdict = f'DEVELOPMENT CHECK ONLY (would be {verdict.split(" ")[0]} on held-out runs; these traces were used to develop the model)'
     print(f'== RESULT: self-replays {"exact" if exact else "NOT exact"}; prediction errors {eL:+.3f} / {eP:+.3f} points (threshold ±{thr}); '
           f'sampling difference {meas_s - meas_all:+.3f} points; noise floor {max(noise) if noise else float("nan"):.3f} points '
           f'-> CALIBRATION {verdict}')
     if verdict != 'PASS':
         print('   The shadow model must not be used to rank replacement preferences (docs/rl/HEADROOM.md, "If calibration fails").')
+    if args.development_data:
+        print('   Not a calibration: a model is calibrated only on runs not used to develop it (docs/rl/HEADROOM.md 7.7).')
     return 0 if verdict == 'PASS' else 1
 
 
@@ -280,6 +292,7 @@ def main(argv=None):
     p.add_argument('--window', type=int, default=4)
     p.add_argument('--no-inclusion-model', action='store_true')
     p.add_argument('--no-coherence-model', action='store_true')
+    p.add_argument('--model-permissions', action='store_true', help='the permission model (docs/rl/HEADROOM.md 7.7)')
     p = sub.add_parser('labels')
     p.add_argument('runs', nargs='+')
     p.add_argument('--window', type=int, default=4)
@@ -290,6 +303,9 @@ def main(argv=None):
     p.add_argument('--threshold', type=float, default=0.5, help='points of the priority-vs-LRU miss difference (default 0.5)')
     p.add_argument('--reference', action='append', help='POLICY=RUN: an untraced run whose all-set misses are listed for context')
     p.add_argument('--null', action='append', help='RUN_A:RUN_B: two traced runs of one policy (noise floor); required for a PASS')
+    p.add_argument('--model-permissions', action='store_true', help='the permission model (docs/rl/HEADROOM.md 7.7)')
+    p.add_argument('--development-data', action='store_true',
+                   help='the traces were used to develop the model: report a development check, never a calibration verdict')
     p = sub.add_parser('orders')
     p.add_argument('run')
     p.add_argument('--all', action='store_true', help='all 720 orders (default: the 60 additive ones)')

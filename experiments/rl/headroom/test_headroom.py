@@ -150,7 +150,7 @@ class TraceBuilder:
         return R.Trace(data=R.encode(self.rec))
 
 
-A, B, C, D = 0x10, 0x20, 0x30, 0x40  # with sets = 1 every line is in set 0
+A, B, C, D, E = 0x10, 0x20, 0x30, 0x40, 0x50  # with sets = 1 every line is in set 0
 
 
 def lru_run(seq, **kw):
@@ -234,6 +234,9 @@ class ShadowLRUTests(unittest.TestCase):
         self.assertEqual(sh.n['decisions'], t['decisions'])
         self.assertEqual(sh.n['victim_differs'], 0)
         self.assertEqual(sh.n['candidates_modelled'], 0)  # every candidate's features are the recorded ones
+        perm = S.replay(tr, 'lru', window=3, model_permissions=True)
+        self.assertEqual((perm.misses(), perm.n['decisions'], perm.n['victim_differs']), (sh.misses(), sh.n['decisions'], 0))
+        self.assertEqual([perm.n[k] for k in S.Shadow.PERM_SELF_ZERO], [0] * len(S.Shadow.PERM_SELF_ZERO))
 
     def test_upgrade_is_a_store_miss_without_a_decision(self):
         b = TraceBuilder()
@@ -361,6 +364,73 @@ class ShadowInclusionTests(unittest.TestCase):
         self.assertEqual((lru.n['inclusion_victims'], lru.n['phantom_accesses'], lru.n['suppressed_accesses'], lru.misses()), (2, 0, 0, 4))
         off = S.replay(tr, order, window=2, model_inclusion=False)
         self.assertEqual((off.n['phantom_accesses'], off.n['suppressed_accesses']), (0, 0))
+
+
+class ShadowPermissionTests(unittest.TestCase):
+    """model_permissions (docs/rl/HEADROOM.md 7.7): the counterfactual copy's MESI state from its own history, and the
+    L1 write permission it implies. Sniper: a read fill is S when another core holds the line, else the L3's own state
+    (M once any core has written the line since it entered the L3); only M is writable in an L1, and an L1 copy takes
+    the L2's state when it is filled."""
+
+    def test_a_counterfactual_sharer_turns_an_l1_write_hit_into_an_upgrade(self):
+        # c0 writes A (L3 dirty); c1 reads A (both S) and keeps it as MRU; c1 reads C: the recorded run evicts A
+        # (victim A), shadow LRU evicts B and keeps A. c0 drops A (D, E) in both. c0 reads A again: in the recorded
+        # run no other core holds it, so Sniper grants M (dirty L3), and c0's next write hits in its L1 (an L1
+        # record, no L2 access). In the shadow c1 still holds A, so c0's fill is S and that write is an L2 upgrade,
+        # which invalidates c1's shadow-only copy.
+        b = TraceBuilder(cores=2)
+        b.roi()
+        b.access(0, A, 'w')
+        b.access(1, A)
+        b.access(1, B)
+        b.access(1, A)
+        b.access(1, C, victim=A)
+        b.access(0, D)
+        b.access(0, E)
+        b.access(0, A, state=R.S_M)
+        b.l1(0, A)              # the load's own L1 record
+        b.l1(0, A, store=True)  # a later store: an L1 write hit in the recorded run
+        tr = b.trace()
+        self.assertEqual(sum(t['contents_misses'] for t in R.trace_tallies(tr).values()), 7)
+        legacy = S.replay(tr, 'lru', window=2)
+        self.assertEqual(legacy.misses(), 7)  # c0: A D E A, c1: A B C (A kept, B evicted)
+        perm = S.replay(tr, 'lru', window=2, model_permissions=True)
+        self.assertEqual(perm.misses(), 8)    # + c0's upgrade
+        self.assertEqual((perm.n['l1_write_upgrades'], perm.n['store_misses_upgrade'], perm.n['fill_state_differs'],
+                          perm.n['inv_modelled']), (1, 1, 1, 1))
+        self.assertFalse(perm.holds(1, A))
+
+    def test_no_counterfactual_sharer_turns_an_upgrade_into_a_hit(self):
+        # c1 reads B, writes A (L3 dirty); c0 reads A (both S). c1 reads C: recorded LRU evicts B, priority evicts the
+        # S line A. c0 drops A (D, E) in both. c0 reads A: the recorded run has c1 as a sharer, so c0 gets S and its
+        # write is an upgrade miss; in the shadow nobody else holds A and the L3 copy is dirty, so c0 gets M and the
+        # write hits.
+        b = TraceBuilder(cores=2)
+        b.roi()
+        b.access(1, B)
+        b.access(1, A, 'w')
+        b.access(0, A)
+        b.access(1, C)
+        b.access(0, D)
+        b.access(0, E)
+        b.access(0, A)
+        b.access(0, A, 'w')
+        tr = b.trace()
+        self.assertEqual(sum(t['contents_misses'] for t in R.trace_tallies(tr).values()), 8)
+        legacy = S.replay(tr, 'priority', window=2)
+        self.assertEqual(legacy.misses(), 8)  # c1: B A C, c0: A D E A + upgrade
+        perm = S.replay(tr, 'priority', window=2, model_permissions=True)
+        self.assertEqual(perm.misses(), 7)
+        self.assertEqual((perm.n['own_state_store_hits'], perm.n['fill_state_differs'], perm.n['l3_state_inferred'],
+                          perm.n['store_misses_upgrade']), (1, 1, 1, 0))
+
+    def test_back_invalidation_leaves_the_l3_copy_clean(self):
+        b = TraceBuilder(cores=2)
+        b.roi()
+        b.access(0, A, 'w')
+        b.invalidate(0, A, R.INV_BACK)
+        perm = S.replay(b.trace(), 'lru', window=2, model_permissions=True)
+        self.assertIs(perm.l3_dirty[A], False)
 
 
 class LabelTests(unittest.TestCase):
