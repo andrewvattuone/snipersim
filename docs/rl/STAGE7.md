@@ -6,6 +6,9 @@
   (d9d0ef43) after review. It is verified with unit tests, a differential test, deterministic replays and smoke tests.
 * **Ocean pilot (12 runs, exploratory):** the variant made the weights stable and learned the predicted order, but
   **raised L2 misses by 10.93%**, with excessive repeated protection. See "Ocean `small` pilot" below.
+* **Invalidation-feedback correction (8 runs, exploratory; unmerged, `review/stage7-protect-invalidation`):** it
+  removed about half of that excess, but L2 misses stayed **+5.65% above LRU**, and pinning stayed at 0.78 ways per
+  set. See "Ocean `small` comparison: protection feedback on invalidation" below.
 * **Unchanged:** the rl-n4 algorithm and every Stage 6 control stay as they are, and the default is the algorithm.
 
 **Background:** on LU `tiny` and Ocean `small`, the frozen LU-derived weights and the fixed priority reduced L2 misses
@@ -548,6 +551,176 @@ Two repetitions per policy: ranges, not significance tests.
 * **Merge, build and regression checks:** `results/archive/stage7-ocean-pilot-prep-20261122.tar.gz`.
 * **Binaries,** kept read-only in `results/`: the main-tree binary used before the merge,
   `stage6-ocean-ablation.sniper-e65141e5`, together with the earlier ones.
+
+## Ocean `small` comparison: protection feedback on invalidation (`results/stage7-ifb-ocean`, archived): EXPLORATORY
+
+Two repetitions per policy: ranges, not significance tests. The correction evaluated here is **not merged**. It lives on
+`review/stage7-protect-invalidation` (implementation 0f2cf3c5, docs 80972542, pushed). That branch's copy of this
+file describes the design, the event analysis and the unit tests in "Protection feedback on invalidation".
+
+**The correction under test** (`rl/protect_invalidation_feedback`, default false):
+* A protected line (one passed over at least once, `is_protected`) that is removed by a coherence invalidation or a
+  back-invalidation before any hit gets +1 on its protection snapshot, once.
+* Upgrades carry the protection and are never rewarded.
+* It requires `protect_feedback`. Nothing else changes: same candidate selection, estimator, horizon, history and
+  reward magnitudes.
+
+**Setup:**
+* **Runs:** four policies × 2 repetitions on `ocean-small` (8 runs), 4 at a time.
+* **Command,** from the review worktree with `SPLASH2_CODES` set: `run_stage6.py results/stage7-ifb-ocean
+  --workloads ocean-small --policies lru,rl-n4-prio,rl-n4-dm65536,rl-n4-dm65536-ifb --reps 2 --jobs 4`.
+* **Configuration:** identical to the Stage 7 pilot above:
+  * `OCEAN -n258 -p4`, complete ROI;
+  * 4 Gainestown cores, the policy on the private L2 only, 8 MB shared L3, prefetchers off;
+  * timeout 3,000 s.
+  * The 8 `sim.cfg` files are identical apart from the policy keys.
+* **Policies** (`run_stage6.py` at 80972542):
+  * `lru`, `rl-n4-prio` and `rl-n4-dm65536`: commands identical to the pilot's;
+  * `rl-n4-dm65536-ifb`: `rl-n4-dm65536` + `perf_model/l2_cache/rl/protect_invalidation_feedback=true`. The dry
+    run shows this is the only difference.
+  * Only the two ifb runs report `protect_invalidation_feedback=1` at start-up (manifest `rl_settings`). No
+    parameter was retuned.
+* **Build and provenance:**
+  * `review/stage7-protect-invalidation` 80972542, clean tree and tooling for every run;
+  * one simulator binary for all 8 runs, md5 `784fc3654a0f5d01c0407df06576db99`. It is identical to the preserved
+    `results/stage7-protect-invalidation.sniper-784fc365`.
+  * the Stage 6 OCEAN executable, md5 `4ce366668180cb5ea1d278b16591cf30`;
+  * `SNIPER_RL_EVENT_CHECK=1 SNIPER_COHERENCE_CHECK=1`.
+  * The binary's regression checks are in `results/stage7-protect-invalidation-verification`: the existing policies
+    are identical in replay, and 108 unit tests pass. They were not repeated, since nothing changed.
+  * `feature/rl-port` was not modified by the experiment.
+* **Outcome:**
+  * all runs exit 0, with no timeouts and 0 stale write hits;
+  * **22 of 22 checker runs pass** (`check_sharers` and `check_rl_events` on every run, `check_rl_policy` on the 6
+    `rl_lru` runs). On the ifb runs, `check_rl_policy` also checks two identities: the per-class sums of the new
+    reward equal its core counter, and the protected residencies ended by invalidation equal the number of new
+    rewards.
+  * wall time 1,553-2,104 s per run.
+
+**Every repetition** (`analysis.txt`, `metrics-per-run.csv`):
+
+| Policy | Rep | Instructions (M) | IPC | Simulated time (µs) | L2 misses | L2 MPKI | L2 demand misses | L2 dirty evictions | L2 invalidations | L2 downgrades | L3 misses | DRAM reads / writes | Victims S / E / M % | Departure from LRU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lru | 1 | 272.64 | 2.3589 | 43,450 | 5,964,297 | 21.876 | 5,707,117 | 4,758,713 | 133,596 | 410,864 | 1,872,639 | 1,550,209 / 1,228,125 | 4.50 / 9.34 / 86.17 | – |
+| lru | 2 | 272.64 | 2.3583 | 43,462 | 5,956,908 | 21.849 | 5,700,268 | 4,741,437 | 132,912 | 411,639 | 1,883,703 | 1,559,156 / 1,229,349 | 4.54 / 9.49 / 85.97 | – |
+| rl-n4-prio | 1 | 272.64 | 2.3595 | 43,440 | 5,846,099 | 21.443 | 5,599,626 | 4,564,574 | 111,664 | 461,711 | 1,881,235 | 1,555,949 / 1,230,400 | 5.87 / 10.15 / 83.98 | 15.58% |
+| rl-n4-prio | 2 | 272.64 | 2.3621 | 43,392 | 5,831,996 | 21.391 | 5,586,910 | 4,559,844 | 111,231 | 459,106 | 1,870,802 | 1,552,023 / 1,226,312 | 5.84 / 10.07 / 84.09 | 15.47% |
+| rl-n4-dm65536 | 1 | 272.64 | 2.3707 | 43,234 | 6,599,974 | 24.208 | 6,338,430 | 5,468,243 | 135,763 | 311,180 | 1,870,619 | 1,547,214 / 1,226,105 | 2.21 / 8.48 / 89.31 | 72.23% |
+| rl-n4-dm65536 | 2 | 272.64 | 2.3677 | 43,288 | 6,649,891 | 24.391 | 6,384,239 | 5,538,885 | 144,869 | 289,375 | 1,874,944 | 1,551,963 / 1,228,715 | 1.47 / 8.51 / 90.02 | 78.17% |
+| rl-n4-dm65536-ifb | 1 | 272.64 | 2.3601 | 43,429 | 6,304,672 | 23.125 | 6,050,237 | 5,132,020 | 122,819 | 350,391 | 1,878,859 | 1,554,126 / 1,230,880 | 3.45 / 9.01 / 87.54 | 56.10% |
+| rl-n4-dm65536-ifb | 2 | 272.64 | 2.3684 | 43,276 | 6,289,824 | 23.070 | 6,035,823 | 5,128,211 | 123,322 | 341,804 | 1,869,262 | 1,548,840 / 1,225,586 | 3.38 / 8.92 / 87.70 | 60.24% |
+
+**Policy diagnostics, per repetition** (`analysis.txt` sections 5-7c, `supplement.txt`):
+
+| Policy | Rep | Rewards: evict-bad / evict-good / protect-good / protect-wasted % | Protections contradicted | Max passes | Ways pinned ≥ 8 decisions, per set | Ways pinned ≥ 2, per set | Victim at LRU position 0 / 1 / 2 / 3 % | Back-invalidations at the L2 | Protected residencies ended by invalidation | New +1 rewards |
+|---|---|---|---|---|---|---|---|---|---|---|
+| lru | 1 / 2 | – | – | – | – | – | – | 267 / 370 | – | – |
+| rl-n4-prio | 1 | 38.2 / 41.3 / 5.0 / 15.5 | 35.0% | 247 | 0.001 | 0.231 | 84.4 / 0.8 / 2.1 / 12.6 | 861 | 374 | – |
+| rl-n4-prio | 2 | 38.1 / 41.6 / 5.0 / 15.3 | 35.1% | 616 | 0.001 | 0.229 | 84.5 / 0.9 / 2.0 / 12.5 | 320 | 209 | – |
+| rl-n4-dm65536 | 1 | 47.2 / 41.7 / 2.9 / 8.1 | 33.7% | 962 | 1.106 | 1.325 | 27.7 / 25.8 / 20.6 / 25.7 | 27,179 | 44,836 | – |
+| rl-n4-dm65536 | 2 | 48.2 / 41.7 / 2.9 / 7.1 | 33.8% | 741 | 1.221 | 1.433 | 21.8 / 27.6 / 24.1 / 26.3 | 33,946 | 60,269 | – |
+| rl-n4-dm65536-ifb | 1 | 44.2 / 42.3 / 3.2 / 10.2 | 36.5% | 901 | 0.743 | 0.979 | 43.9 / 21.6 / 14.1 / 20.2 | 11,913 | 20,952 | 20,952 |
+| rl-n4-dm65536-ifb | 2 | 44.1 / 42.8 / 3.2 / 9.8 | 35.7% | 759 | 0.806 | 1.054 | 39.7 / 24.7 / 13.7 / 21.7 | 12,546 | 22,146 | 22,146 |
+
+* **Pinned ways** and **max passes** are defined as in the pilot. Max passes is the maximum over cores.
+* **Back-invalidations** are the L2's `rl-event-inv-back-invalidation`, summed over cores. **L2 invalidations** in the
+  run table are `coherency-invalidates`, a different counter.
+* **Residencies of ≥ 33 passes, ended by hit / eviction / invalidation:**
+  * dm65536: 5,121 / 21,070 / 30,371 and 5,763 / 17,878 / 40,542;
+  * ifb: 2,133 / 22,935 / 13,405 and 2,537 / 24,631 / 13,777.
+* **Share of coherence and back-invalidations that removed a protected line:** dm65536 22.5% and 28.0%, ifb 12.2%
+  and 12.9%, priority 0.1-0.3%.
+* **The new rewards by class** (r1 / r2):
+  * by state: S 20,727 / 21,942 (99%), E 207 / 150, M 18 / 54;
+  * by sharing: below the threshold (BT) 15,639 / 16,001 (75%), above it (AT) 5,313 / 6,145;
+  * 2.3-2.5% of all protection outcomes.
+  * The telemetry classifies them by snapshot class only, so **their split between coherence and back-invalidation is
+    not available**.
+
+**Weights of the learned policies** (second half of the ROI, the four cores pooled, r1 / r2):
+
+| | rl-n4-dm65536 | rl-n4-dm65536-ifb |
+|---|---|---|
+| Mean S | −0.07 / −0.22 | +0.14 / +0.15 |
+| Mean E | +0.33 / +0.31 | +0.33 / +0.34 |
+| Mean M | +0.09 / +0.07 | +0.16 / +0.16 |
+| Mean BT | +0.11 / +0.09 | +0.18 / +0.18 |
+| Mean AT | −0.69 / −0.68 | +0.00 / −0.03 |
+| Weight sd per feature | 0.13-0.28 | 0.18-0.27 |
+| Order changes of wS, wE, wM per 1,000 decisions | 0.09 / 0.07 | 0.16 / 0.17 |
+| AT snapshot sign changes | 0.1% | 1.3% / 1.1% |
+| State order (ties distinguished) | E>M>S 70.6% / 88.3% | E>M>S 41.0% / 42.1%, E>S>M about as often (modal in r1, 41.8%) |
+
+Neither learned policy reaches the priority order S > E > M.
+
+**Means, change vs this comparison's LRU** (two repetitions each):
+
+| | rl-n4-prio | rl-n4-dm65536 | rl-n4-dm65536-ifb | ifb vs dm65536 |
+|---|---|---|---|---|
+| L2 misses | −2.04% | +11.15% | **+5.65%** | −4.95% |
+| L2 demand misses | −1.94% | +11.53% | +5.95% | −5.00% |
+| L2 dirty evictions | −3.96% | +15.86% | +8.00% | −6.79% |
+| L2 invalidations | −16.36% | +5.30% | −7.64% | −12.29% |
+| L2 downgrades | +11.95% | −26.98% | −15.84% | +15.26% |
+| L3 misses | −0.11% | −0.29% | −0.22% | – |
+| DRAM reads | −0.04% | −0.33% | −0.21% | – |
+| Simulated time | −0.09% | −0.45% | −0.24% | +0.21% |
+| Departure from LRU | 15.5% | 75.2% | 58.2% | – |
+| Ways pinned ≥ 8 decisions, per set | 0.001 | 1.16 | 0.78 | −33% |
+
+**Pre-stated expectations** (review branch, "Proposed experiment") **against the result:**
+
+| Expectation | Result | Met? |
+|---|---|---|
+| Pinned well below 1.07, e.g. < 0.2 ways per set | 0.74-0.81 | No |
+| Back-invalidations back near 1 k | 11.9-12.5 k (LRU 0.3 k, priority 0.3-0.9 k) | No |
+| Most rewarded invalidations S or AT | S 99%; sharing 75% BT | S yes, AT no |
+| Departure well below 70% | 56-60% (priority 15.5%) | Partly |
+| L2 misses below `rl-n4-dm65536` in both repetitions | −4.8% and −5.1% | Yes |
+| L2 misses below LRU | +5.8% and +5.5% | No |
+
+**The interpretation rule stated in advance applies:** pinning stayed above 0.5 ways per set. The missing
+invalidation outcome is therefore not the main cause of the pinning.
+
+**Measured improvements** (ifb against dm65536, both repetitions):
+* about half of dm65536's excess L2 misses removed (+11.15% → +5.65% vs LRU);
+* about a third of the pinning removed (1.16 → 0.78 ways per set);
+* departure from LRU 75% → 58%; the oldest candidate is the victim 40-44% of the time instead of 22-28%;
+* back-invalidations −60%; invalidations removing a protected line 22-28% → 12-13%;
+* dirty evictions −6.8%, L2 invalidations −12.3%;
+* the S and AT weights rose (AT −0.69 → about 0), and S and heavily shared victims about doubled. This is an
+  association with two runs, not a demonstrated cause.
+
+**Remaining shortcomings:**
+* **Still worse than LRU** in both repetitions (+5.5-5.8% L2 misses, +8% dirty evictions). It is 7.7 points behind
+  the fixed priority (−2.0%).
+* **Pinning stays high,** at 0.74-0.81 ways per set against 0.001 for priority. Max passes did not change (759-901
+  against 741-962).
+* **Long protections that end by eviction did not fall** (21-25 k residencies of ≥ 33 passes per run). Each of them
+  already gets the +1 protect-wasted reward at its end.
+* **Coherence costs shift rather than fall.** Against dm65536, downgrades rose 15%. Against LRU, there are fewer
+  invalidations and downgrades but more write-backs. L3 and DRAM traffic are unchanged for every policy.
+* The weights are somewhat less stable than dm65536's, though still far more stable than rl-n4's.
+* **Simulated time:** no meaningful change. ifb is −0.06% and −0.42% vs LRU, against a 0.53% spread across the 8
+  archived LRU runs.
+
+**Repeatability notes:**
+* On this binary, `rl-n4-dm65536` departed from LRU 72-78% of the time, against 70% in the pilot (ae285766). The
+  code path is the same with the option off.
+* Its misses agree with the pilot (+10.7-11.6% vs LRU in both batches), and priority's agree as well (−1.9 to −2.4%).
+
+**Verdict:** **partially helps, remains inferior to LRU.** The correction should not be merged as an improvement on
+this evidence. The branch is kept for reference.
+
+**Archive:**
+* **Comparison:** `results/archive/stage7-ifb-ocean-20261122.tar.gz`, sha256
+  `732b674dddab59636a5f8bd58ebb5bee8fc3c0d7e973f58ade7f89d207a1d5b0` (also in its `.sha256`). It holds:
+  * the run directories, manifest, checker output, summary and CSVs;
+  * `analysis.txt` and `supplement.txt` with their scripts (`analysis-scripts/stage7_ifb_ocean.py`, `supplement.py`);
+  * `PROVENANCE.txt`, `READOUT.txt`, the command and the progress log.
+  * `results/stage7-ifb-ocean` itself is read-only.
+* **Binary:** `results/stage7-protect-invalidation.sniper-784fc365`, read-only, with its `.md5`.
+* **Correction verification:** `results/archive/stage7-protect-invalidation-verification-20261122.tar.gz`.
 
 ## Limits of this investigation
 
