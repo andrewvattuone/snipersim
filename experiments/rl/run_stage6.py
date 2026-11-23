@@ -4,7 +4,7 @@
 Usage: run_stage6.py OUTDIR --workloads sharetest-r,sharetest-u --l3 8192 --reps 2 [--jobs 5] [--timeout SECONDS]
                      [--policies lru,sf-text,sf-example,rl-n2,rl-n4] [--dry-run]
        (also lru-hist, the controls rl-n4-frozen, rl-n4-prio, rl-n4-rand, and the Stage 7 configurations
-       rl-n4-dm65536, rl-n4-ema001: see POLICIES)
+       rl-n4-dm65536, rl-n4-ema001, rl-n4-dm65536-ifb: see POLICIES)
 
 Every simulation gets the same explicit configuration apart from the policy keys: 4-core Gainestown, private L2 as
 the only cache with the policy under test, prefetchers off, traceinput/num_runs = 1, the given shared L3 size, and
@@ -101,6 +101,9 @@ POLICIES.update({
     'rl-n4-dm65536': RL_N4_BASE + [f'{L2}/rl/estimator=discounted_mean', f'{L2}/rl/horizon=65536'],
     'rl-n4-ema001':  [f'{L2}/rl/alpha=0.01' if o == f'{L2}/rl/alpha=0.1' else o for o in RL_N4_BASE] + [f'{L2}/rl/estimator=ema'],
 })
+# Stage 7 reward correction (docs/rl/STAGE7.md): rl-n4-dm65536 + rl/protect_invalidation_feedback=true (a protected line
+# invalidated before a hit gets the protect-wasted outcome +1). Defined for the proposed comparison; not yet run.
+POLICIES['rl-n4-dm65536-ifb'] = POLICIES['rl-n4-dm65536'] + [f'{L2}/rl/protect_invalidation_feedback=true']
 assert POLICIES['rl-n4-ema001'].count(f'{L2}/rl/alpha=0.01') == 1 and f'{L2}/rl/alpha=0.1' not in POLICIES['rl-n4-ema001']
 # Workloads: name -> command after `--`, whether to simulate the ROI only, and an optional stdin file.
 # The SPLASH-2 arguments are those of the benchmarks repository's splashrun, with 4 threads.

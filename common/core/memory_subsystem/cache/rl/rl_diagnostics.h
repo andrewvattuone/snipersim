@@ -187,6 +187,7 @@ struct RewardDiagStats {
   std::uint64_t double_contradict = 0;  // protect-wasted (+1), then the evicted block returned (-1)
   std::uint64_t double_snapshot_differs = 0; // the +1 rewarded other features than the eviction recorded
   std::uint64_t double_dropped = 0;     // entry left the history without an outcome (fill without on_miss; expect 0)
+  ClassCounts protect_invalidated{};    // protect_invalidation_feedback: protected lines invalidated, by snapshot class
 };
 
 class RewardObserver
@@ -348,8 +349,11 @@ public:
   }
 
   // Before RewardPolicy::on_invalidate
-  void before_invalidate(const RewardPolicy&, std::uint32_t set, std::uint32_t way, std::uint64_t tag, InvalidationReason reason)
+  void before_invalidate(const RewardPolicy& p, std::uint32_t set, std::uint32_t way, std::uint64_t tag, InvalidationReason reason)
   {
+    const auto& cfg = p.config();
+    if (cfg.protect_invalidation_feedback && cfg.mode != Mode::off && reason != InvalidationReason::upgrade && p.line(set, way).is_protected)
+      stats.protect_invalidated.add(p.line(set, way).snapshot);
     if (reason == InvalidationReason::upgrade)
       runs_.upgrade_invalidate(set, way, tag, true);
     else

@@ -59,7 +59,7 @@ RUN_SPECIFIC = ('output_dir', 'trace_prefix', 'script0name')
 
 
 # rl_lru settings reported in the manifest's rl_settings and printed per policy
-SETTING_KEYS = ('estimator', 'horizon', 'alpha', 'window', 'selection', 'learning', 'initial_weights')
+SETTING_KEYS = ('estimator', 'horizon', 'alpha', 'window', 'selection', 'learning', 'initial_weights', 'protect_invalidation_feedback')
 
 
 def is_policy_key(sec, k):
@@ -301,8 +301,8 @@ def main(argv):
         print(f'  ERROR: {e}')
     cols = ['ipc', 'time_us', 'l1d_mpki', 'l2_mpki', 'l2_miss', 'l2_inval', 'l2_dirty_evict', 'l3_miss', 'dram_rd', 'dram_wr']
     # Known policies in a fixed order, then any other policy found (so no run is silently left out of the tables)
-    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4', 'rl-n4-ema001', 'rl-n4-dm65536', 'rl-n4-frozen',
-             'rl-n4-prio', 'rl-n4-rand']
+    order = ['lru', 'lru-hist', 'sf-text', 'sf-example', 'rl-n2', 'rl-n4', 'rl-n4-ema001', 'rl-n4-dm65536', 'rl-n4-dm65536-ifb',
+             'rl-n4-frozen', 'rl-n4-prio', 'rl-n4-rand']
     order += sorted({k[2] for k in groups} - set(order))
     for (w, l3) in sorted({(k[0], k[1]) for k in groups}):
         roi = any(r['roi'] for k, g in groups.items() if k[:2] == (w, l3) for r in g)

@@ -31,6 +31,8 @@
  *   protected (passed-over) block hit                    -1
  *   protected block evicted without a hit                +1
  *   coherence / back invalidation, upgrade               none
+ *   protected block invalidated (coherence or back        +1   only with protect_invalidation_feedback (Stage 7,
+ *     invalidation) without a hit since its protection          off by default; an upgrade carries the protection)
  *
  * Event order on a miss (as in ChampSim, where the tag check precedes find_victim):
  *   on_miss(set, tag) -> [choose -> commit -> on_eviction(victim)] -> on_fill(set, way, tag, demand)
@@ -175,6 +177,10 @@ struct RewardConfig {
   // Experimental Stage 7 variant (default: the algorithm's EMA)
   Estimator estimator = Estimator::ema;
   double horizon = 65536.0; // Estimator::discounted_mean: discount time constant in decisions (> 0)
+  // Experimental Stage 7 reward correction (default off: the algorithm). A protected (passed-over) line that leaves
+  // through a coherence or back invalidation before any hit gets the protect-wasted outcome +1 on its protection
+  // snapshot, as an eviction without a hit does; otherwise its protection is dropped without any outcome.
+  bool protect_invalidation_feedback = false;
 };
 
 /*
@@ -293,6 +299,7 @@ struct RewardStats {
   std::uint64_t evict_good = 0;     // +1: history entry aged out
   std::uint64_t protect_good = 0;   // -1: protected block hit
   std::uint64_t protect_wasted = 0; // +1: protected block evicted without a hit
+  std::uint64_t protect_invalidated = 0; // +1: protected line invalidated without a hit (protect_invalidation_feedback)
   std::uint64_t passes = 0;         // passed-over events
   std::uint32_t max_passes = 0;     // most times one block was passed over (repeated protection, audit I-1)
   std::array<std::uint64_t, 3> invalidations{}; // by InvalidationReason
@@ -509,13 +516,20 @@ public:
   }
 
   /*
-   * A block left without a replacement decision. Never an eviction: no history entry, no feedback, and a later miss on
-   * it is not blamed on the policy (it is not in the history). For an upgrade, the metadata is kept for the refill.
+   * A block left without a replacement decision. Never an eviction: no history entry, and a later miss on it is not
+   * blamed on the policy (it is not in the history). For an upgrade, the metadata is kept for the refill. With
+   * protect_invalidation_feedback, a protected line removed by a coherence or back invalidation (it was passed over and
+   * not hit since) gets +1 on its protection snapshot, once: its metadata is cleared here. Without it (the default),
+   * the protection is dropped without feedback.
    */
   void on_invalidate(std::uint32_t set, std::uint32_t way, std::uint64_t tag, InvalidationReason reason)
   {
     ++stats.invalidations.at(static_cast<std::size_t>(reason));
     auto& l = line_(set, way);
+    if (cfg_.protect_invalidation_feedback && cfg_.mode != Mode::off && reason != InvalidationReason::upgrade && l.is_protected) {
+      ++stats.protect_invalidated;
+      reward(set, l.snapshot, +1.0);
+    }
     if (reason == InvalidationReason::upgrade) {
       // One pending upgrade per set. A second one before the first refill (possible only if several hardware threads
       // or cores share this cache, see POLICY_CORES.md) replaces it; the first refill then starts fresh.

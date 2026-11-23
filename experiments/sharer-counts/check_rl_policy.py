@@ -139,6 +139,15 @@ def check(run, s):
                 eq.append(('victim position 0', d('victim-position-0'), g('rl-chose-oldest')))
                 eq.append(('history hits', d('miss-replaced-in-history'), g('rl-reward-evict-bad')))
                 eq.append(('double-dropped', d('double-dropped'), 0))
+                # Stage 7 rl/protect_invalidation_feedback (statistics exist only with the option on): every protected
+                # line removed by a coherence or back invalidation gets exactly one outcome, so the runs of passes that
+                # ended by an invalidation must equal those rewards
+                if has('rl-reward-protect-invalidated'):
+                    pi = g('rl-reward-protect-invalidated')
+                    eq.append(('reward-protect-invalidated by sharing', d('reward-protect-invalidated-BT') + d('reward-protect-invalidated-AT'), pi))
+                    eq.append(('reward-protect-invalidated by state', sum(d(f'reward-protect-invalidated-{c}') for c in 'SEM'), pi))
+                    eq.append(('runs ended by invalidation vs protect-invalidated',
+                               sum(d(f'run-invalidated-{b}') for b in ('1', '2', '3-4', '5-8', '9-16', '17-32', '33+')), pi))
             else:
                 eq.append(('history-hit by sharing', d('history-hit-BT') + d('history-hit-AT'), g('sf-reward-negative')))
                 eq.append(('history-hit by state', sum(d(f'history-hit-{c}') for c in 'SEM'), g('sf-reward-negative')))

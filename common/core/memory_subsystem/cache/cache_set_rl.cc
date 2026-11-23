@@ -121,6 +121,10 @@ CacheSetInfoRL::CacheSetInfoRL(String name, String cfgname, core_id_t core_id, U
       LOG_ASSERT_ERROR(std::isfinite(c.horizon) && c.horizon >= 1.0, "%s/rl/horizon must be a finite number >= 1 (%f)", cfgname.c_str(), c.horizon);
       LOG_ASSERT_ERROR(c.estimator == rlrepl::Estimator::discounted_mean || !horizon_set,
                        "%s/rl/horizon is only used with rl/estimator=discounted_mean", cfgname.c_str());
+      // Experimental Stage 7 reward correction (docs/rl/STAGE7.md); off by default
+      c.protect_invalidation_feedback = Sim()->getCfg()->getBoolDefault(cfgname + "/rl/protect_invalidation_feedback", false);
+      LOG_ASSERT_ERROR(!c.protect_invalidation_feedback || c.protect_feedback,
+                       "%s/rl/protect_invalidation_feedback needs rl/protect_feedback=true (nothing is protected otherwise)", cfgname.c_str());
       rlrepl::WeightTable initial;
       const char *const weight_keys[5] = {"S", "E", "M", "BT", "AT"};
       double w[5];
@@ -149,6 +153,9 @@ CacheSetInfoRL::CacheSetInfoRL(String name, String cfgname, core_id_t core_id, U
       if (c.estimator != rlrepl::Estimator::ema)
          printf("[RL] %s core %d: rl_lru STAGE7 estimator=%s horizon=%g decisions (alpha unused)\n", name.c_str(), core_id,
                 std::string(rlrepl::name(c.estimator)).c_str(), c.horizon);
+      if (c.protect_invalidation_feedback)
+         printf("[RL] %s core %d: rl_lru STAGE7 protect_invalidation_feedback=1 (+1 to a protected line invalidated before a hit)\n",
+                name.c_str(), core_id);
    }
    registerStats(name, core_id);
    setupDiagnostics(name, cfgname, core_id, associativity, num_sets);
@@ -272,6 +279,8 @@ CacheSetInfoRL::registerDiagnosticStats(String name, core_id_t core_id)
       reg("double-contradict", &s.double_contradict);
       reg("double-snapshot-differs", &s.double_snapshot_differs);
       reg("double-dropped", &s.double_dropped);
+      if (m_reward->config().protect_invalidation_feedback) // only then, so default runs keep their statistics
+         regClasses("reward-protect-invalidated", s.protect_invalidated);
       regRuns(d.reward->runs());
    }
    reg("misses", &d.misses.total);
@@ -381,6 +390,8 @@ CacheSetInfoRL::registerStats(String name, core_id_t core_id)
       registerStatsMetric(name, core_id, p + "reward-evict-good", &s.evict_good);
       registerStatsMetric(name, core_id, p + "reward-protect-good", &s.protect_good);
       registerStatsMetric(name, core_id, p + "reward-protect-wasted", &s.protect_wasted);
+      if (m_reward->config().protect_invalidation_feedback) // only then, so default runs keep their statistics
+         registerStatsMetric(name, core_id, p + "reward-protect-invalidated", &s.protect_invalidated);
       registerStatsMetric(name, core_id, p + "passes", &s.passes);
       callback("max-passes", STAT_MAX_PASSES);
       registerStatsMetric(name, core_id, p + "inv-coherence", &s.invalidations[(int)rlrepl::InvalidationReason::coherence]);
