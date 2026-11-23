@@ -2,9 +2,10 @@
 
 **Status:**
 * **Investigation:** done, from existing Stage 6 statistics and telemetry only. No new benchmark simulation was run.
-* **Variant:** one experimental, opt-in variant, on the review branch `review/stage7-discounted-mean`. It is
-  verified with unit tests, a differential test, deterministic replays and short smoke tests, but **not evaluated**
-  on any workload.
+* **Variant:** one experimental, opt-in variant (`rl/estimator=discounted_mean`), merged into `feature/rl-port`
+  (d9d0ef43) after review. It is verified with unit tests, a differential test, deterministic replays and smoke tests.
+* **Ocean pilot (12 runs, exploratory):** the variant made the weights stable and learned the predicted order, but
+  **raised L2 misses by 10.93%**, with excessive repeated protection. See "Ocean `small` pilot" below.
 * **Unchanged:** the rl-n4 algorithm and every Stage 6 control stay as they are, and the default is the algorithm.
 
 **Background:** on LU `tiny` and Ocean `small`, the frozen LU-derived weights and the fixed priority reduced L2 misses
@@ -110,8 +111,17 @@ fed i.i.d. ±1 rewards with each feature's long-run mean reward μ in that run (
 | Weight sd: observed / i.i.d. null | 0.64-0.74 / 0.21-0.23 | 0.38-0.73 / 0.12-0.23 |
 | Snapshots with \|w\| > 0.9 | 21-47% per feature | 4-61% per feature |
 | Lag-1 autocorrelation of w_M (1,000 decisions apart); null ≈ 0 | +0.71 to +0.74 | +0.29 to +0.38 |
-| Snapshots in which the most common order of wS, wE, wM holds | 23-25% (null 53-55%) | 42-51% (null 82-84%) |
+| Snapshots in which the most common order of wS, wE, wM holds (exact ties counted as ties) | 17-19% (null 53-55%) | 42-51% (null 82-84%) |
 | Order flips of the state weights | 25-27 per 1,000 decisions | 25-28 per 1,000 decisions |
+
+**Correction (after the Stage 7 pilot):** this row first gave 23-25% for Ocean.
+* **The cause:** the first count ranked exact ties in the fixed order S, E, M, so a tie such as E = M > S was counted
+  as E > M > S.
+* **How often ties occur:** on Ocean, rl-n4's E and M weights are often exactly equal, both saturated at the same
+  value. Exact ties occur in 7-9% of second-half snapshots on Ocean and ≤ 1% on LU.
+* **The corrected figures:** the most common strict order holds in 17-19% of snapshots on Ocean, and 42-51% on LU
+  (unchanged).
+* **The null model** draws continuous, independent weights, which practically never tie, so its figures are unaffected.
 
 **The reward stream itself is phase-structured** (`bursts.txt`), measured per 1,000-decision interval and per core:
 
@@ -260,7 +270,7 @@ w_f(t) = ( w0·e^(−t/H) + Σ_k e^(−(t − t_k)/H)·r_k ) / ( e^(−t/H) + Σ
   * the division can be done per update or replaced by a comparison of cross-products when two weights are compared.
 
 **5. How to test the hypothesis independently** (a proposal; not run):
-* **H1, stability:** the variant's state order holds in ≥ 90% of second-half snapshots on LU and Ocean (rl-n4: 23-51%),
+* **H1, stability:** the variant's state order holds in ≥ 90% of second-half snapshots on LU and Ocean (rl-n4: 17-51%),
   and its weight sd is near the i.i.d. level. This can be measured from the snapshots, the same analysis as C.
 * **H2, misses:** L2 misses at or below `rl-n4-frozen` on LU and below rl-n4 on Ocean, in every repetition.
 * **Runs:** `rl-n4`, the variant at H = 2^16, the horizon sensitivity H = 2^14 and 2^18, and the EMA with α = 0.01
@@ -375,7 +385,169 @@ See `results/stage7-discounted-mean-verification/PROVENANCE.txt` for the binary 
   * each core printed the STAGE7 line once.
   * The variant was added to `run_stage6.py`'s policy table at run time by a wrapper
     (`results/stage7-discounted-mean-verification/scripts/smoke.py`); the script itself is unchanged.
-* **Not done:** no LU or Ocean comparison, and no claim about misses or performance.
+* **Not done in this verification:** no LU or Ocean comparison. The Ocean pilot below came later.
+
+## Ocean `small` pilot (`results/stage7-ocean-pilot`, archived): EXPLORATORY
+
+Two repetitions per policy: ranges, not significance tests.
+
+**Setup:**
+* **Runs:** six policies × 2 repetitions on `ocean-small` (12 runs), 4 at a time.
+* **Command:** `run_stage6.py results/stage7-ocean-pilot --workloads ocean-small --policies
+  lru,rl-n4,rl-n4-ema001,rl-n4-dm65536,rl-n4-frozen,rl-n4-prio --reps 2 --jobs 4`.
+* **Configuration:** as in the Stage 6 Ocean comparison:
+  * `OCEAN -n258 -p4`, complete ROI;
+  * 4 Gainestown cores, the policy on the private L2 only, 8 MB shared L3, prefetchers off;
+  * timeout 3,000 s.
+  * The 12 `sim.cfg` files are identical apart from the policy keys.
+* **Policies** (`run_stage6.py` at d9d0ef43):
+
+  | Policy | Configuration | Initial weights |
+  |---|---|---|
+  | `lru` | `replacement_policy=lru` | – |
+  | `rl-n4` | `rl_lru`, mode both, window 4, EMA α 0.1, protection feedback, global weights | 0 |
+  | `rl-n4-ema001` | rl-n4 with α 0.01 (`estimator=ema`) | 0 |
+  | `rl-n4-dm65536` | rl-n4 + `estimator=discounted_mean`, `horizon=65536` | 0 (no LU input) |
+  | `rl-n4-frozen` | rl-n4 + `learning=false` | S −0.09, E −0.38, M −0.76, BT −0.64, AT 0 (LU, unchanged) |
+  | `rl-n4-prio` | rl-n4 + `learning=false`, `selection=priority` | – |
+
+  Each run's manifest line records the configured options (`policy_options`) and the settings every L2 printed at
+  start-up (`rl_settings`). All runs of a policy report the same settings.
+* **Build and provenance:**
+  * `feature/rl-port` d9d0ef43, clean tree;
+  * one simulator binary for all 12 runs, md5 `ae285766…` (the merged build);
+  * the Stage 6 OCEAN executable, md5 `4ce36666…`.
+* **Regression checks before the pilot** (`results/stage7-ocean-pilot-prep`):
+  * 97 unit tests pass, and the differential test is identical over 608 configurations;
+  * deterministic replays of all 9 existing policies are identical to the validated replays;
+  * `rl-n4-dm65536` is identical to the review build's replays;
+  * 64 of 64 checker runs pass.
+* **Outcome:**
+  * all runs exit 0, with no timeouts and 0 stale write hits;
+  * **34 of 34 checker runs pass** (`check_sharers` and `check_rl_events` on every run, `check_rl_policy` on the 10
+    `rl_lru` runs);
+  * wall time 1,337-1,436 s per run;
+  * the frozen and priority weights stayed constant.
+
+**Every repetition** (`analysis.txt`, `metrics-per-run.csv`):
+
+| Policy | Rep | Instructions (M) | IPC | Simulated time (µs) | L2 misses | L2 MPKI | L2 demand misses | L2 dirty evictions | L2 invalidations | L2 downgrades | L3 misses | DRAM reads / writes | Victims S / E / M % | Departure from LRU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lru | 1 | 272.64 | 2.3593 | 43,444 | 5,962,823 | 21.871 | 5,705,868 | 4,753,769 | 133,123 | 410,467 | 1,878,550 | 1,551,652 / 1,230,918 | 4.50 / 9.39 / 86.11 | – |
+| lru | 2 | 272.64 | 2.3549 | 43,524 | 5,970,477 | 21.899 | 5,714,346 | 4,757,379 | 132,511 | 411,238 | 1,884,096 | 1,560,525 / 1,230,128 | 4.52 / 9.44 / 86.04 | – |
+| rl-n4 | 1 | 272.64 | 2.3603 | 43,424 | 5,893,802 | 21.617 | 5,636,660 | 4,668,385 | 128,182 | 422,647 | 1,873,219 | 1,551,856 / 1,227,379 | 4.80 / 9.65 / 85.55 | 17.40% |
+| rl-n4 | 2 | 272.64 | 2.3630 | 43,375 | 5,887,234 | 21.594 | 5,629,410 | 4,661,799 | 129,703 | 421,035 | 1,875,244 | 1,553,673 / 1,227,983 | 4.75 / 9.67 / 85.58 | 17.17% |
+| rl-n4-ema001 | 1 | 272.64 | 2.3615 | 43,403 | 5,853,751 | 21.471 | 5,595,695 | 4,632,825 | 122,102 | 418,452 | 1,881,345 | 1,557,901 / 1,229,417 | 4.74 / 9.79 / 85.47 | 22.77% |
+| rl-n4-ema001 | 2 | 272.64 | 2.3626 | 43,382 | 5,860,470 | 21.495 | 5,604,179 | 4,643,015 | 120,470 | 420,525 | 1,873,440 | 1,553,836 / 1,225,874 | 4.82 / 9.72 / 85.46 | 22.83% |
+| rl-n4-dm65536 | 1 | 272.64 | 2.3702 | 43,244 | 6,653,144 | 24.403 | 6,393,544 | 5,516,448 | 135,745 | 314,189 | 1,877,569 | 1,554,164 / 1,227,334 | 2.19 / 8.56 / 89.26 | 70.03% |
+| rl-n4-dm65536 | 2 | 272.64 | 2.3707 | 43,233 | 6,583,982 | 24.149 | 6,323,472 | 5,442,462 | 132,821 | 307,267 | 1,878,381 | 1,552,681 / 1,228,100 | 2.34 / 8.64 / 89.02 | 70.09% |
+| rl-n4-frozen | 1 | 272.64 | 2.3602 | 43,426 | 5,829,116 | 21.381 | 5,583,730 | 4,550,412 | 110,818 | 459,274 | 1,880,084 | 1,556,437 / 1,229,632 | 5.86 / 10.19 / 83.95 | 15.62% |
+| rl-n4-frozen | 2 | 272.64 | 2.3602 | 43,427 | 5,824,009 | 21.362 | 5,580,479 | 4,541,019 | 108,972 | 461,783 | 1,882,760 | 1,557,692 / 1,228,862 | 5.98 / 10.24 / 83.78 | 15.81% |
+| rl-n4-prio | 1 | 272.64 | 2.3607 | 43,417 | 5,820,731 | 21.349 | 5,574,990 | 4,545,760 | 110,560 | 458,396 | 1,876,868 | 1,553,280 / 1,228,276 | 5.85 / 10.14 / 84.00 | 15.54% |
+| rl-n4-prio | 2 | 272.64 | 2.3619 | 43,394 | 5,818,747 | 21.342 | 5,575,568 | 4,541,197 | 108,888 | 461,615 | 1,874,848 | 1,550,832 / 1,227,536 | 6.00 / 10.13 / 83.88 | 15.69% |
+
+**Policy diagnostics, per repetition** (`analysis.txt`, `pinning.txt`):
+
+| Policy | Rep | Rewards: evict-bad / evict-good / protect-good / protect-wasted % | Protections contradicted | Max passes (one block) | Ways pinned ≥ 8 decisions, per set | All candidates tied | Victim at LRU position 0 / 1 / 2 / 3 % |
+|---|---|---|---|---|---|---|---|
+| rl-n4 | 1 | 41.6 / 44.3 / 2.8 / 11.3 | 42.0% | 58 | 0.034 | 70.8% | 82.6 / 7.3 / 3.8 / 6.2 |
+| rl-n4 | 2 | 41.4 / 44.6 / 2.8 / 11.1 | 42.1% | 76 | 0.033 | 70.5% | 82.8 / 7.2 / 3.8 / 6.2 |
+| rl-n4-ema001 | 1 | 40.7 / 44.2 / 3.6 / 11.5 | 40.7% | 98 | 0.097 | 65.6% | 77.2 / 9.1 / 5.6 / 8.1 |
+| rl-n4-ema001 | 2 | 40.8 / 44.3 / 3.7 / 11.2 | 41.0% | 95 | 0.107 | 65.9% | 77.2 / 8.8 / 5.8 / 8.2 |
+| rl-n4-dm65536 | 1 | 47.8 / 41.1 / 2.9 / 8.3 | 33.9% | 1,855 | 1.079 | 27.0% | 30.0 / 23.9 / 21.0 / 25.1 |
+| rl-n4-dm65536 | 2 | 47.1 / 41.5 / 2.9 / 8.5 | 33.8% | 857 | 1.067 | 26.9% | 29.9 / 24.7 / 19.8 / 25.6 |
+| rl-n4-frozen | 1 | 38.1 / 41.4 / 4.9 / 15.6 | 35.6% | 199 | 0.001 | 83.9% | 84.4 / 0.8 / 2.1 / 12.7 |
+| rl-n4-frozen | 2 | 38.2 / 41.3 / 4.9 / 15.6 | 35.9% | 323 | 0.001 | 83.8% | 84.2 / 0.9 / 2.2 / 12.8 |
+| rl-n4-prio | 1 | 38.1 / 41.6 / 5.0 / 15.2 | 36.1% | 207 | 0.001 | 84.0% | 84.5 / 0.8 / 2.0 / 12.7 |
+| rl-n4-prio | 2 | 37.9 / 41.6 / 4.9 / 15.6 | 36.2% | 194 | 0.001 | 83.9% | 84.3 / 0.8 / 2.1 / 12.8 |
+
+* **Pinned ways** is the mean, per decision, of the number of ways in the set that have been passed over at least 8
+  consecutive decisions without a hit (`rl-diag-pinned-long`).
+* **Max passes** is the largest number of times one block was passed over, on any core.
+
+**Weights of the learned policies** (second half of the ROI, the four cores pooled):
+
+| | rl-n4 | rl-n4-ema001 | rl-n4-dm65536 |
+|---|---|---|---|
+| Weight sd per feature | 0.63-0.74 | 0.48-0.66 | 0.13-0.27 |
+| Snapshot-to-snapshot sign changes per feature | 15.8-23.8% | 3.6-13.5% | 0.2-1.5% |
+| Snapshots with \|w\| > 0.9 per feature | 19.5-47.3% | 0.4-30.6% | 0-1.4% |
+| Order changes of wS, wE, wM per 1,000 decisions | 25.9-26.4 | 5.0-5.1 | 0.10-0.11 |
+| Most common order (ties distinguished) and its share | M>E>S 17.6%, E>S>M 18.3% | E>S>M 26.8-27.6% | E>M>S 69.3-72.2% |
+| Snapshots with E>M>S | 15.9-16.2% | 24.2-25.8% | 69.3-72.2% |
+| Mean weights S / E / M / BT / AT | +0.18 / +0.26 / +0.16-0.17 / +0.17 / +0.10-0.12 | +0.14-0.16 / +0.41-0.42 / +0.17-0.18 / +0.19 / +0.10-0.11 | −0.03 to −0.05 / +0.32-0.33 / +0.07-0.09 / +0.09-0.11 / −0.68 to −0.71 |
+
+**Means, change vs LRU** (two repetitions each):
+
+| | rl-n4 | rl-n4-ema001 | rl-n4-dm65536 | rl-n4-frozen | rl-n4-prio |
+|---|---|---|---|---|---|
+| L2 misses | −1.28% | −1.84% | **+10.93%** | −2.35% | −2.46% |
+| L2 demand misses | −1.35% | −1.93% | +11.36% | −2.24% | −2.36% |
+| L2 dirty evictions | −1.90% | −2.47% | +15.22% | −4.41% | −4.46% |
+| L2 invalidations | −2.92% | −8.68% | +1.10% | −17.26% | −17.39% |
+| L2 downgrades | +2.67% | +2.10% | −24.37% | +12.09% | +11.96% |
+| L3 misses | −0.38% | −0.21% | −0.18% | +0.01% | −0.29% |
+| Simulated time | −0.19% | −0.21% | −0.56% | −0.13% | −0.18% |
+| Departure from LRU | 17.3% | 22.8% | 70.1% | 15.7% | 15.6% |
+
+**Consistency with earlier Ocean batches** (Stage 6 ablation and Pilot 3; other binaries, same configuration):
+* **LRU:** all six runs span 5,945,424-5,970,477 L2 misses (0.42%) and 43,296-43,524 µs (0.53%).
+* **rl-n4:** all six runs span 5,887,234-5,906,796 L2 misses.
+* **Frozen and priority:** −2.35% and −2.46% here, against −2.37% and −2.24% in the Stage 6 comparison.
+
+**Findings, kept separate:**
+1. **Weight stability improved substantially with the discounted mean** (observed):
+   * the weights' sd fell from 0.63-0.74 to 0.13-0.27;
+   * state-order changes fell from 26 to 0.1 per 1,000 decisions;
+   * the predicted order E > M > S was learned and held in 69-72% of second-half snapshots. The target of ≥ 90% in
+     the test plan above was not met.
+
+   A smaller α (0.01) gave a partial improvement: 5 order changes per 1,000 decisions.
+2. **L2 replacement performance became worse with the discounted mean** (observed):
+   * **+10.93% L2 misses** against LRU's mean, above every LRU run in this pilot and in the earlier batches;
+   * +15.2% dirty evictions;
+   * the oldest candidate was the victim in only 30% of decisions (departure from LRU 70.1%, against 15.6-22.8% for
+     the other policies).
+3. **The discounted mean produced excessive repeated protection** (observed):
+   * about 1.07 of every 8 ways per set were pinned (passed over ≥ 8 consecutive decisions), against 0.03 for rl-n4,
+     0.10 for α 0.01 and 0.001 for frozen and priority;
+   * one block was passed over up to 1,855 times;
+   * 1.41 passes per decision, against 0.33-0.45.
+   * Its victims shift away from S (2.2-2.3% against 4.5%) and heavily shared blocks (0.3-0.4% against 1.2%); the
+     learned weights keep those strongly (AT −0.68 to −0.71).
+4. **Simulated time was slightly lower, but that is not evidence of a speedup.**
+   * **The measurement:** −0.56% against this pilot's LRU mean. Its two runs (43,233 and 43,244 µs) are the lowest of
+     all 32 Ocean runs so far.
+   * **Why it is not a speedup:**
+     * the next lowest (Pilot 3's `sf-text`, 43,264 and 43,288 µs) differ by only 0.05-0.13%;
+     * LRU's six runs span 0.53%;
+     * the reduction coincides with 11% more L2 misses and 24% fewer downgrades, and how Ocean's run time depends on
+       L2 misses versus coherence events has not been established.
+
+   Two runs per policy do not support claiming a meaningful speedup.
+5. **The smaller α did better than rl-n4, but not as well as the fixed settings:**
+   * rl-n4-ema001's L2 misses (−1.84%) are below all six rl-n4 runs to date;
+   * they are still 0.5-0.6 points above frozen and priority.
+
+**Observation versus hypothesis.**
+* **Observed:** the 10.93% miss increase, the 70% departure rate and the pinning are measurements.
+* **Hypothesis, not established:** the explanation offered so far is that the reward gives a pinned block no
+  corrective feedback. A protected block that is hit earns −1 ("keep"). One that is never evicted earns nothing
+  until it leaves. One that leaves through a coherence invalidation earns nothing at all. rl-n4's noisy weights had
+  broken such pins by chance.
+* **Consistent with it:** of the runs of ≥ 33 passes, 27.4-27.6 k ended in an invalidation under the discounted mean,
+  against 22-25 under rl-n4.
+* **Not shown:** that the missing feedback causes the pinning, nor that supplying it would remove the pinning or the
+  extra misses.
+
+**Archive:**
+* **Pilot:** `results/archive/stage7-ocean-pilot-20261122.tar.gz` (sha256 in its `.sha256`). It holds:
+  * the run directories, manifest, checker output, summary and CSVs;
+  * `analysis.txt`, `pinning.txt` and their scripts (`analysis-scripts/`);
+  * `PROVENANCE.txt`, `READOUT.txt`, the command and the progress log.
+* **Merge, build and regression checks:** `results/archive/stage7-ocean-pilot-prep-20261122.tar.gz`.
+* **Binaries,** kept read-only in `results/`: the main-tree binary used before the merge,
+  `stage6-ocean-ablation.sniper-e65141e5`, together with the earlier ones.
 
 ## Limits of this investigation
 
@@ -385,4 +557,4 @@ See `results/stage7-discounted-mean-verification/PROVENANCE.txt` for the binary 
   timing inside an interval is not recorded.
 * **Prediction, not evidence:** the expected benefit of the variant rests on the in-sample LU frozen vector. Its effect
   on Ocean is a stated prediction.
-* **The Ocean S question in D is open.** The variant may well show that stability is not enough there.
+* **The Ocean S question in D is open.** On Ocean, stability alone did not help (the pilot below).
