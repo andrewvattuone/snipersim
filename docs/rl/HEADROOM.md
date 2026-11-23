@@ -4,8 +4,11 @@
 `review/stage7-protect-invalidation` (also unmerged).
 * It adds observation-only instrumentation and offline tools, verified on unit tests, deterministic single-core
   replays and short 4-core smoke runs ([section 6](#6-verification-phase-4)).
-* No Ocean or LU comparison has been run with it, and no learning algorithm or reward was changed.
-* The calibration in [section 7](#7-calibration-plan-phase-5) is a proposal awaiting approval.
+* No learning algorithm or reward was changed.
+* **The four-run Ocean calibration (section 7) was run on 2026-11-23 and FAILED** under the pre-registered criterion
+  ([section 7.6](#76-calibration-result-ocean-small-four-runs-2026-11-23)): 7 of 8 predictions were within ±0.5 points and one
+  missed by +0.508. All 8 underestimate priority's benefit. Until a revised model passes a held-out calibration, the
+  shadow must not be used to rank replacement preferences ([section 7.4](#74-if-calibration-fails)).
 
 **Why:** the Stage 7 objective investigation (`results/stage7-objective-investigation/REPORT.md`) found that the
 rl_lru rewards are absolute per-block labels, not relative judgements. Before another learning redesign, we want to
@@ -475,3 +478,73 @@ The next step would then be online experiments only, or a better model justified
 
 LU `tiny` remains exploratory: its upstream factorization pivots on the smallest element (`docs/rl/CAPBENCH.md`). Any
 LU trace is a second, exploratory check of the same model, never the calibration.
+
+### 7.6 Calibration result (Ocean `small`, four runs, 2026-11-23)
+
+Results: `results/stage7-headroom-calibration/` (read-only; `CALIBRATION-REPORT.txt`, `VALIDATION.txt`, the four
+`calibrate-*.txt`, `diagnose-stores.txt`), archived as `results/archive/stage7-headroom-calibration-20261123.tar.gz`
+(sha256 `57c88209…6916014`). Binary `25290da9` (this branch), every L2 set traced, LRU ×2 and `rl-n4-prio` ×2.
+
+**Verdict: FAIL** (narrow). The criterion fixed in advance was that *every* cross-prediction be within ±0.5 points.
+Seven of eight are; one is not (+0.508). Passing seven of eight does not meet that criterion, and the threshold is
+not relaxed after the fact. The per-pair `RESULT` lines in three of the `calibrate-*.txt` files say PASS because
+each file judges one pair only; the calibration is the conjunction of the four. The verdict is not INCONCLUSIVE:
+the noise floor (0.10 points) is a fifth of the tolerance, and all eight errors have the same sign.
+
+**Validity of the runs** (`VALIDATION.txt`; all critical checks pass):
+* 4/4 completed normally with a complete ROI and trace end markers; 10/10 checker runs pass.
+* Trace tallies equal `sim.stats` per core, except one fill and one decision at the ROI-end race in LRU r1.
+* Traced vs untraced runs (9 LRU, 6 priority): L2 misses, evictions and simulated time are within the untraced
+  spread. Coherence invalidations are 1.0-2.8% lower in all four traced runs, just below the untraced minimum
+  (plausibly the tracer's lock changing interleavings).
+
+**Self-replays: exact** on all four traces: 5.42-5.53 M decisions, 100% identical victims, and every must-be-zero
+counter (modelled candidates, phantom and suppressed accesses, modelled or deferred invalidations, orphans,
+unresolved fills) 0.
+
+**Cross-predictions** (contents misses, ROI; priority vs LRU, in points of the LRU misses):
+
+| Pair (LRU, priority) | Measured | From the LRU trace (error) | From the priority trace (error) |
+|---|---|---|---|
+| r1, r1 | −2.301% | −2.001% (+0.301) | −1.930% (+0.371) |
+| r1, r2 | −2.397% | −2.001% (+0.396) | −1.889% (**+0.508**) |
+| r2, r1 | −2.227% | −1.984% (+0.243) | −1.930% (+0.297) |
+| r2, r2 | −2.323% | −1.984% (+0.339) | −1.889% (+0.433) |
+
+* Noise floor (null pairs): LRU r1 vs r2 −0.076 points, priority r1 vs r2 −0.098 points (both ≤ 0.25).
+* The sampled-set and all-set differences agree within 0.001 points (every set is traced).
+
+**Mechanism counts** (pair r1, r1; the other pairs agree within about 0.3 points of error%):
+
+| Count | LRU rec | prio pred | prio rec | error | LRU pred | error |
+|---|---|---|---|---|---|---|
+| L2 accesses | 11,148,025 | 11,162,098 | 11,151,729 | +0.09% | 11,136,526 | −0.10% |
+| **Upgrade misses** | 255,744 | 255,383 | 243,442 | **+4.91%** | 243,827 | **−4.66%** |
+| Decisions | 5,525,977 | 5,429,041 | 5,423,990 | +0.09% | 5,515,767 | −0.18% |
+| Coherence invalidations | 165,490 | 143,470 | 142,305 | +0.82% | 164,847 | −0.39% |
+| Inclusion victims | 112,036 | 127,255 | 128,209 | −0.74% | 113,223 | +1.06% |
+| Dirty evictions | 4,756,102 | 4,548,636 | 4,548,024 | +0.01% | 4,749,954 | −0.13% |
+
+* Modelled behaviour: LRU → priority: phantom accesses 22.2-23.0 k, suppressed 8.2-8.5 k, modelled invalidations
+  2-45, deferred 0, modelled candidates 8.7%. Priority → LRU: phantom ~8.0 k, suppressed 22.9-23.3 k, modelled
+  invalidations 22.4-22.7 k, deferred 0, modelled candidates 9.1-9.2%.
+* Sensitivity (pair r1, r1, errors from the LRU / priority trace): full model +0.301 / +0.371; no inclusion model
+  −0.149 / +0.373; no coherence model +0.295 / +0.210; neither −0.155 / +0.214. The access, inclusion and
+  coherence counts support both modelled rules (within about 1%), so the smaller error without the inclusion model
+  is a cancellation, not evidence against the rule.
+
+**The upgrade-miss discrepancy.** Every count but one is within about 1%. The shadow predicts essentially no change
+in upgrade misses between the policies (LRU trace replayed as priority: 255,383, vs 255,744 recorded under LRU),
+whereas the priority runs record about 12,300 fewer. By the line's state before the store (`diagnose-stores.txt`),
+priority has about 12,000 fewer stores that find their line in S; stores finding E are unchanged (126.3-126.6 k);
+L2 store accesses fall by about 10,700 and stores that hit M rise by about 4,600. Restoring the missing change
+would move the r1, r1 errors to about +0.10 / +0.17 points: about two thirds of the bias. That residual would remain
+unexplained.
+
+**Limitations shown by this calibration.**
+* The shadow replays the recorded L2 reference stream. Which stores reach the L2, and in what state, depends on L1
+  write permission, which depends on the L2 state when the L1 copy was filled; the model did not represent this.
+* A line held by both the shadow and the recorded cache took the recorded state, even when the recorded cache had
+  dropped and refetched it while the shadow kept its own copy (both points are being investigated on the existing traces).
+* Even a passing calibration on LRU and priority would not justify predictions for policies far from the recorded
+  one (oracles, the whole-set optimum), whose decisions rest more on modelled features and events.
