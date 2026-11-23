@@ -42,6 +42,7 @@ Tests, in `testing/unit/rl/` (outside `common/`, never part of the Sniper build)
 | `test_event_order.cc` | Regression tests for the order of events on a miss (history lookup before the eviction) |
 | `test_diagnostics.cc` | Stage 4 observers: no decision changes, totals equal the cores' counters, runs, ties, double rewards |
 | `test_controls.cc` | Experimental controls: defaults, initial and frozen weights, priority order and ties, window and eligibility, seeded random draws, diagnostics |
+| `test_protect_invalidation.cc` | Stage 7 reward correction (`protect_invalidation_feedback`): off by default and unchanged, coherence and back-invalidation outcomes, upgrades carried, one outcome per protected residency, hits first, controls, the discounted-mean clock, observer and run identities |
 | `test_estimator.cc` | Stage 7 variant (`Estimator::discounted_mean`): default unchanged, exact discounted mean, time-based span under phase-structured and bursty rewards, prior and learning off, eviction-history and protection hard cases, controls and diagnostics unaffected |
 | `diff_cores.cc` | Differential check against another tree's cores (`make diff-cores OLD=<tree>`), not part of `test` |
 | `Makefile`, `.gitignore` | Build/run; the test and diff binaries and outputs are ignored |
@@ -554,6 +555,26 @@ are in [`STAGE7.md`](STAGE7.md). The default is the algorithm, unchanged.
   Default runs print exactly what they printed before.
 * **Errors:** `rl/horizon` without `estimator=discounted_mean` is a configuration error.
 * **Tests:** `testing/unit/rl/test_estimator.cc`.
+
+#### Stage 7 reward correction: protection feedback on invalidation (experimental)
+
+An opt-in reward correction on the review branch `review/stage7-protect-invalidation`. The default is the algorithm.
+The investigation behind it and the proposed test are in [`STAGE7.md`](STAGE7.md), "Protection feedback on
+invalidation".
+
+```
+-g perf_model/l2_cache/rl/protect_invalidation_feedback=false   # default; true needs rl/protect_feedback=true
+```
+
+* **The default:** a protected line removed by a coherence or back invalidation loses its protection without any
+  outcome.
+* **With the option:** it gets protect-wasted's +1 on its protection snapshot, once per protected residency, through the
+  configured estimator. Upgrades carry the protection into the refill and are never rewarded.
+* **Unchanged:** every other reward, the history, the selection and the estimators.
+* **Statistics** (only with the option): `rl-reward-protect-invalidated` and `rl-diag-reward-protect-invalidated-<class>`.
+  `check_rl_policy.py` then checks that the runs of passes ended by an invalidation equal the rewarded count.
+* **Start-up line:** `[RL] L2 core N: rl_lru STAGE7 protect_invalidation_feedback=1 ...`.
+* **Tests:** `testing/unit/rl/test_protect_invalidation.cc`.
 
 ### Event checker
 

@@ -6,6 +6,8 @@
   (d9d0ef43) after review. It is verified with unit tests, a differential test, deterministic replays and smoke tests.
 * **Ocean pilot (12 runs, exploratory):** the variant made the weights stable and learned the predicted order, but
   **raised L2 misses by 10.93%**, with excessive repeated protection. See "Ocean `small` pilot" below.
+* **Reward correction (review branch `review/stage7-protect-invalidation`, not evaluated):** an opt-in protection
+  outcome when a protected line is invalidated before a hit. See "Protection feedback on invalidation" below.
 * **Unchanged:** the rl-n4 algorithm and every Stage 6 control stay as they are, and the default is the algorithm.
 
 **Background:** on LU `tiny` and Ocean `small`, the frozen LU-derived weights and the fixed priority reduced L2 misses
@@ -548,6 +550,198 @@ Two repetitions per policy: ranges, not significance tests.
 * **Merge, build and regression checks:** `results/archive/stage7-ocean-pilot-prep-20261122.tar.gz`.
 * **Binaries,** kept read-only in `results/`: the main-tree binary used before the merge,
   `stage6-ocean-ablation.sniper-e65141e5`, together with the earlier ones.
+
+## Protection feedback on invalidation (`review/stage7-protect-invalidation`)
+
+**Status:** an experimental, opt-in reward correction on a review branch. It is verified (unit, differential, replay
+and smoke tests) but **not evaluated**. The default is the algorithm, unchanged.
+
+### What happens to a protected line today (code review of `rl_reward_policy.h`)
+
+A line is *protected* when a decision passes it over: an older candidate is kept while a younger one is evicted.
+
+| Event | Call | Protection outcome today | Other effects |
+|---|---|---|---|
+| Passed over by a decision | `commit` | none | `is_protected` set; the snapshot is overwritten with the features at this pass; `passes` +1 |
+| Passed over again, without a hit | `commit` | none (no reward per pass) | snapshot overwritten again; `passes` grows (diagnostic only; `max_passes` records it) |
+| Hit (a recency-updating hit) | `on_hit` | **protect-good −1** on the snapshot; protection cleared | a later pass protects it again |
+| Evicted by replacement | `commit` (it is the victim) | **protect-wasted +1** on the snapshot; protection cleared | `on_eviction` puts it in the history, so its return (−1) or age-out (+1) follows: two outcomes per lifetime |
+| Coherence invalidation (another core's write) | `on_invalidate(coherence)` | **none: the protection is dropped** (`LineMeta{}`) | no history entry; the later miss counts as a coherence miss, not the policy's |
+| Back-invalidation (the inclusive L3 evicts it) | `on_invalidate(back_invalidation)` | **none: dropped** | as for coherence |
+| Upgrade (this core writes a Shared line) | `on_invalidate(upgrade)`, then `on_fill(upgrade_refill)` | none | the metadata (protection, snapshot, passes) is stashed and restored at the refill. In Sniper every upgrade refill matches its stash: `check_rl_policy` requires 0 unmatched refills and 0 overwritten stashes |
+
+**So a protected line has three ways out, and only two of them produce an outcome.** Hits and evictions produce one;
+invalidations produce none.
+
+### The excessive-protection problem in the archived diagnostics
+
+`results/stage7-protect-invalidation-verification/protection-exits.txt` (`scripts/protection_exits.py`), from the
+archived ROI statistics. A *run* of passes (`rl-diag-run-<end>-<length>`) is a block's consecutive passes since its
+fill or last hit. With protection feedback on, a run is exactly a protected residency.
+* **The identity:** in every run of every batch, the runs ended by a hit equal the core's protect-good count, and those
+  ended by an eviction equal its protect-wasted count.
+* **What follows:** the runs ended by an invalidation are exactly the protected residencies that received no outcome.
+
+| Batch | Policy | Protected residencies without an outcome (invalidated) | Share of all protection outcomes | Share among residencies of ≥ 9 passes | Share among residencies of ≥ 33 passes | Share of the L2's coherence + back invalidations that hit a protected line | Back-invalidations |
+|---|---|---|---|---|---|---|---|
+| Stage 7 Ocean pilot | rl-n4-dm65536 | 41,492-44,001 | 5.0-5.4% | 26.4-27.8% | 51.0-51.3% | 21.5-22.4% | 23,891-24,252 |
+| | rl-n4 | 3,359-3,955 | 0.4% | 1.7-3.6% | 5.8-7.1% | 2.0-2.4% | 520-539 |
+| | rl-n4-ema001 | 4,778-4,904 | 0.5% | 2.0-4.5% | | 3.1% | 642-881 |
+| | rl-n4-frozen, rl-n4-prio | 217-425 | ≤ 0.05% | 0% | | 0.1-0.3% | 342-640 |
+| Stage 6 Ocean ablation | rl-n4 | 3,448-3,449 | 0.4% | 2.4-2.9% | | 2.1% | 316-1,697 |
+| | frozen, priority, random | 115-1,426 | ≤ 0.2% | 0% | | 0.1-0.8% | 283-1,685 |
+| Stage 6 LU `tiny` ablation | rl-n4 | 2,123-2,177 | 2.5% | 3.3-6.1% | | 1.0-1.1% | 0 |
+| | frozen, priority, random | 938-3,280 | 0.9-3.7% | 0-16.7% | | 0.5-1.5% | 0 |
+
+**Findings:**
+* **The missing feedback is negligible where the policy does not pin.** It is 0.4% of protection outcomes for rl-n4
+  and ≤ 0.05% for frozen and priority on Ocean; on LU it is small in absolute terms.
+* **In the discounted-mean variant it is concentrated where the pinning is:**
+  * half of the residencies of ≥ 33 passes end in an invalidation with no outcome;
+  * one in five of all the L2's invalidations hits a protected line.
+* **Back-invalidations rise from about 0.3-1.7 k to 24 k per run.** Lines held this long are dropped by the inclusive
+  L3, plausibly because the L3 sees no access to a line the L2 keeps hitting or holding. This is not verified.
+* **What is not known:** the feature classes of the unrewarded residencies. The diagnostics did not classify them, and
+  the new option records them.
+  * **The protection outcomes the variant did receive** (per run): S 75 k good / 46 k wasted (protection mean
+    −0.24) and AT 15 k / 5 k.
+  * **If most of the 41-44 k unrewarded residencies were S or AT,** recording them would reverse the sign of the
+    protection evidence for those features. That is a hypothesis, and it is what the correction would test.
+* **Conclusion: significant enough to test,** because the missing outcomes sit exactly in the regime that failed. It is
+  not shown to be sufficient: pinned lines ended by hits (−1, "keep") and late evictions are unaffected.
+
+### Is a +1 on invalidation defensible?
+
+**What it asserts:** "this protection produced no reuse before the line left." That is the meaning protect-wasted
+already has at an eviction.
+* **Not a verdict that the protection was wrong:** the alternative, evicting this line, would have kept another block
+  whose value is unknown.
+* **Not a claim about the coherence event:** it does not say the policy caused the invalidation.
+
+**Why it is better than no outcome:** today the protection outcomes are censored by how the line leaves.
+* **Who is missed:** lines likely to be invalidated (Shared lines that other cores write, and long-held lines that the
+  L3 back-invalidates) are counted only when they happen to reach a hit or an eviction first.
+* **The resulting bias:** the evidence is tilted toward "keep" for exactly those classes, a survivorship bias.
+* **The fix removes it:** recording an outcome for every exit removes that bias; it does not add one.
+
+**Bias against Shared blocks:**
+* **The direct effect:** it raises wS (evict S sooner) when S lines die by invalidation before any reuse. That is the
+  intended correction, and it moves toward what the two fixed settings that did best on Ocean do. It also teaches
+  "evict blocks likely to be invalidated", a known coherence-aware heuristic.
+* **Risk 1, an unrepresentative snapshot:** the +1 goes to the snapshot of the last pass. A line passed over as S that
+  was later written locally (upgrade, still protected) and then invalidated as M rewards S. This is the same
+  attribution rule as every other protection outcome.
+* **Risk 2, workload dependence:** where Shared lines are read again soon after the protection decision and only then
+  invalidated, the hit comes first (−1) and nothing changes. Where they are invalidated first, evicting them earlier
+  costs nothing the invalidation would not have cost.
+
+  A workload where evicting S earlier is harmful, despite those lines being invalidated before reuse, would have to show
+  higher L2 misses for the corrected policy. That is one of the proposed metrics below.
+* **Magnitude:** +1, the same as an eviction without a hit. Not scaled by the number of passes, and applied once per
+  protected residency.
+* **Back-invalidation:** treated the same way; the line sat unused in the L2 until the L3 dropped it.
+* **Upgrades:** not an exit, so never rewarded; the protection continues into the refill.
+
+**What it does not address:**
+* pins that end in a hit (−1 reinforces keeping);
+* the cost of holding a way across hundreds of passes.
+
+If the correction does not reduce the pinning, the next candidate is to charge that cost (a pass limit or a per-pass
+cost), which changes the protection semantics more.
+
+### Implementation
+
+```
+-g perf_model/l2_cache/rl/protect_invalidation_feedback=false   # default; true: the correction (needs rl/protect_feedback=true)
+```
+
+* **Semantics** (`RewardPolicy::on_invalidate`): with the option on, mode not off, and reason coherence or
+  back-invalidation, a line that is protected (passed over and not hit since) gets `reward(snapshot, +1)` and
+  `stats.protect_invalidated` +1. This happens before its metadata is cleared, so at most once per protected residency.
+  * The reward goes through the configured estimator: the EMA, or the discounted mean on the decision clock.
+  * `learning=false` counts it without changing a weight.
+  * Upgrades are unchanged.
+* **Statistics** (registered only with the option on, so default runs keep exactly their statistics):
+  * `L2.rl-reward-protect-invalidated`;
+  * `L2.rl-diag-reward-protect-invalidated-{S,E,M,BT,AT}`, by snapshot class (observer).
+* **Checker** (`check_rl_policy.py`, when those statistics exist):
+  * the class totals equal the core counter;
+  * the runs of passes ended by an invalidation equal `rl-reward-protect-invalidated`.
+* **Start-up line** (option on only): `[RL] L2 core N: rl_lru STAGE7 protect_invalidation_feedback=1 (+1 to a protected
+  line invalidated before a hit)`. Configuring it without `rl/protect_feedback=true` is an error.
+* **Runner:** `run_stage6.py` policy `rl-n4-dm65536-ifb` = `rl-n4-dm65536` + the option, defined for the proposed
+  comparison and not run. `summarize_stage6.py` lists it and reports the setting.
+* **Overhead:**
+  * no new per-line state: it uses the existing protection flag and snapshot;
+  * one 64-bit counter per cache in `RewardStats`, and 5 in the observer;
+  * one branch per invalidation, plus one weight update per rewarded invalidation;
+  * `sizeof(RewardConfig)` and `sizeof(RewardStats)` grow by one field each.
+* **Unchanged:** candidate selection, eligibility, both estimators, the history and every other reward event, cache
+  geometry, MESI and timing.
+
+### Verification (`results/stage7-protect-invalidation-verification`)
+
+* **Unit tests:** 108 cases (97 existing, 11 new), 0 failed. The new cases:
+  * **Off by default,** and off the old behaviour.
+  * **Exits:** coherence and back-invalidation of a protected line give one +1 on its snapshot; an unprotected line, or
+    a hit after the protection, gives nothing.
+  * **Upgrades:** they carry the protection without a reward, and a later exit is rewarded once; duplicate events give
+    nothing.
+  * **Repeated passes:** 50 passes give one outcome, on the last snapshot.
+  * **Other rewards:** eviction, history and protection rewards are unchanged.
+  * **Mode off, learning off, and the priority control,** whose decisions are unchanged.
+  * **The discounted-mean clock.**
+  * **Whole traces:** off is identical to the default over a full trace with invalidations and upgrades; on, the trace
+    differs.
+  * **Identities:** the observer's class totals and the runs ended by invalidation equal the core counter (3 seeds × 2
+    estimators).
+* **Mutation checks:** each deliberate mistake makes cases fail:
+  * rewarding upgrades: 2 fail;
+  * rewarding unprotected lines: 4 fail;
+  * ignoring back-invalidations: 3 fail.
+* **Differential test** (`make diff-cores OLD=<feature/rl-port 5cb01d4e tree>`): identical, 608 configurations.
+* **Deterministic replays** with the review build (md5 `784fc365…`, configured as the main build), on the LU `tiny`
+  and FFT traces.
+  * **With the option off:** `lru`, `lru-hist`, `sf-text`, `sf-example`, `rl-n2`, `rl-n4`, `rl-n4-frozen`,
+    `rl-n4-prio`, `rl-n4-rand`, `rl-n4-ema001` and `rl-n4-dm65536` are identical to the merged-build replays (`ae285766…`).
+    That is 22 of 22, with the same statistic names and values beyond host wall-clock times, the same victim-sequence
+    hash and the same start-up lines.
+  * **With the option on:** `rl-n4-dm65536-ifb` prints its STAGE7 line and registers the new counter. A single core
+    has no coherence invalidations, so it is a smoke test only.
+  * **Checkers:** 70 of 70 checker runs pass.
+* **Live 4-core smoke** (`sharetest-w` and `capbx-lu-tiny-smoke`, `rl-n4-dm65536` with the option off and on):
+  * all 4 runs ok, and all 18 checker runs pass (including the measured interval and the new identity);
+  * the settings are recorded in the manifest.
+  * **How much this exercises:** the new path fired only 3 times (LU, identity 3 = 3) and 0 times on `sharetest-w`.
+    The volume test of the path is the unit tests (thousands of rewarded invalidations on random traces), and the
+    proposed Ocean comparison.
+* **Tooling:** with the new build, the summaries of the Stage 6 and Stage 7 batches are byte-identical, and
+  `check_rl_policy.py` output is identical on archived runs. The pilot's CSV gains one empty column
+  (`set_protect_invalidation_feedback`).
+
+### Proposed next experiment (not run)
+
+**Ocean `small`, two repetitions, 8 runs:** `lru`, `rl-n4-prio`, `rl-n4-dm65536` and `rl-n4-dm65536-ifb`.
+* **Configuration and timeout:** as in the Stage 7 pilot; about 45 minutes at 4 concurrent.
+* **Binary:** all four policies on one binary that has the option, the review build or the main tree after a merge.
+  The existing policies are verified identical on it.
+* **Optional:** `rl-n4-frozen` as a second reference (+2 runs).
+
+| Question | Metrics (per run, vs `rl-n4-dm65536`, LRU and priority) | Pre-stated expectation if the hypothesis holds |
+|---|---|---|
+| Does excessive protection decrease? | ways pinned ≥ 8 decisions per set; max passes; passes per decision; residencies of ≥ 33 passes and how they end; back-invalidations; `rl-reward-protect-invalidated` and its class split | pinned well below 1.07 (e.g. < 0.2); back-invalidations back near 1 k; most rewarded invalidations S or AT |
+| Is the departure from LRU less extreme? | departure rate; victim window position 0-3; all-tied share | departure well below 70% (toward the 16-23% of the other policies) |
+| Do L2 misses improve? | L2 misses, demand misses, MPKI | below `rl-n4-dm65536` in both repetitions; below LRU would be needed for the correction to be useful |
+| Do coherence or write-back costs worsen? | invalidations, downgrades, dirty evictions, coherence write-backs, L3 misses, DRAM traffic, simulated time | invalidations and downgrades move toward priority's (fewer invalidations, more downgrades); no DRAM change |
+| Is it just forced toward the fixed priority? | learned weights and order over time (S, AT especially); victim S / E / M and heavily-shared shares; window positions, each against `rl-n4-prio` | if its order becomes S > E > M with AT first and its victim mix matches priority's, the correction makes the learner reproduce the fixed rule. That is worth knowing, but it is not evidence that learning adds value. Value would need a workload where it differs from priority and does better |
+
+**Interpretation rules:**
+* **If pinning stays high** (> 0.5 ways per set), the missing invalidation outcome is not the main cause; the next
+  candidate is the cost of holding a way.
+* **If pinning falls but misses stay above LRU,** the reward direction itself (the victim's own return, not a
+  comparison with the kept candidate) remains the problem.
+
+Two repetitions remain a pilot: ranges, not significance.
 
 ## Limits of this investigation
 
