@@ -9,6 +9,14 @@
   ([section 7.6](#76-calibration-result-ocean-small-four-runs-2026-11-23)): 7 of 8 predictions were within ±0.5 points and one
   missed by +0.508. All 8 underestimate priority's benefit. Until a revised model passes a held-out calibration, the
   shadow must not be used to rank replacement preferences ([section 7.4](#74-if-calibration-fails)).
+* **Investigation of the failure** ([section 7.7](#77-investigation-of-the-upgrade-miss-discrepancy-existing-traces-only-2026-11-23)),
+  on the existing traces only:
+  * It found two rule mistakes and a missing L1 write-permission mechanism in the shadow. An opt-in correction
+    (`model_permissions`, from Sniper's code) keeps self-replays exact.
+  * On the same (development) traces, all eight errors fall to +0.03 to +0.32 points.
+  * That is not a calibration: a held-out calibration is required before any use.
+  * Recommendation ([section 7.8](#78-recommendation-for-review-nothing-launched)): one pre-registered held-out
+    calibration, then stop if it fails.
 
 **Why:** the Stage 7 objective investigation (`results/stage7-objective-investigation/REPORT.md`) found that the
 rl_lru rewards are absolute per-block labels, not relative judgements. Before another learning redesign, we want to
@@ -545,6 +553,170 @@ unexplained.
 * The shadow replays the recorded L2 reference stream. Which stores reach the L2, and in what state, depends on L1
   write permission, which depends on the L2 state when the L1 copy was filled; the model did not represent this.
 * A line held by both the shadow and the recorded cache took the recorded state, even when the recorded cache had
-  dropped and refetched it while the shadow kept its own copy (both points are being investigated on the existing traces).
+  dropped and refetched it while the shadow kept its own copy (investigated in section 7.7).
 * Even a passing calibration on LRU and priority would not justify predictions for policies far from the recorded
   one (oracles, the whole-set optimum), whose decisions rest more on modelled features and events.
+
+### 7.7 Investigation of the upgrade-miss discrepancy (existing traces only, 2026-11-23)
+
+Results: `results/stage7-headroom-upgrade-investigation/` (`REPORT.txt`, the replay JSONs, `devcheck-*.txt`, scripts).
+No simulation was run; only the four calibration traces and their statistics were used. Tools: this branch,
+`f935dbbe`.
+
+#### How Sniper decides whether a store reaches the L2
+
+The following rules come from Sniper's code (`parametric_dram_directory_msi/cache_cntlr.cc`, `cache/cache_state.h`) and
+were checked on the recorded traces (`l1perm-*.txt`):
+1. **Only M is writable** (`CacheState::writable`). An L1 store to a line held in S or E misses in the L1. The L1
+   invalidates its copy before forwarding the request (`cache_cntlr.cc:1010`), so the L2's L1-presence bit is always
+   clear at a recorded L2 store (all 2.3 M per trace).
+2. **An L1 copy takes the L2's state when it is filled** (`copyDataFromNextLevel`; the L2 is private).
+3. **A read fill of the private L2 from the shared L3** (`copyDataFromNextLevel`, "MESI fill fix", `:1269`) is S if
+   another core's L2 actually holds the line (`otherUpperCacheHolds`, `:2777`). Otherwise it is the **L3's own state**:
+   E, or M once any core has written the line since it entered the L3 (the L3 is the last level and upgrades
+   silently, `:1781`). The hierarchy is inclusive: an L3 eviction back-invalidates every upper copy (`:2344`).
+4. Consequently a store is an L1 write hit exactly when the L2 copy is M (L1 present and L2 in M ⇒ L1 in M). In the
+   recorded traces, every recorded L1-D write hit (1.83-1.86 M per trace) is on a line whose L2 copy is M (directly,
+   or at the next way record for fresh fills: 99.7% M in a 10 M-record sample of LRU r1, the rest downgraded by
+   another core's read in between).
+   About 0.24-0.27 M per trace are write hits right after a *read* miss: the read fill was granted M by a dirty L3.
+
+#### What the shadow got wrong (classes A-D of the investigation request)
+
+| Class | Finding |
+|---|---|
+| **A. Mistakes in existing rules** | (1) A shadow copy also held by the recorded cache always took the **recorded** state, even when the two copies had different histories (the recorded cache had refetched the line while the shadow kept it, or the shadow refilled it while the recorded cache kept its copy). (2) A shadow read fill without other holders was given **E**, whereas Sniper grants the L3's state, usually **M** on Ocean. (3) An exclusive fill's hint was 1 + other holders; Sniper counts the other holders after invalidating them (hint 1). |
+| **B. A missing mechanism the trace can reconstruct** | L1 write permission. A recorded L1 write hit on a counterfactual copy that is not M is an L2 upgrade in the counterfactual; a recorded upgrade of a counterfactual copy that is M is a hit. The trace's store rule records the first L1 store after any event of the line, so every store whose permission can differ is in the trace. |
+| **C. Information the trace cannot recover** | (1) The L3's dirty state after an L3 eviction of a line that no L2 held: these are silent, so the history is stale; 12.4-13.2% of the recorded fills without sharers find a clean L3 copy where the history said dirty (never the reverse). Inside a period when the recorded run holds the line in some L2, the inclusive L3 cannot drop it without a recorded back-invalidation, and every inference of the model is made inside such a period. A counterfactual L3 whose contents differ from the recorded one remains unmodelled. (2) Whether the L1 held the line at a recorded L2 store (the bit is cleared before the request is forwarded): a recorded upgrade of a counterfactual M copy is counted as an L2 hit, not as an L1 hit. Misses are unaffected; accesses are overstated by the own-state hits (11-12 k). (3) Sharer counts (the hint) when only the counterfactual sharer *count* differs: the recorded hint is kept. |
+| **D. Policy-dependent streams or timing** | After the correction, a residual in demand misses that no counted mechanism accounts for: from the LRU traces, priority's demand misses over-predicted by 5.0-6.8 k (+0.09-0.12%); from the priority traces, LRU's under-predicted by 10.7-13.9 k (−0.18-0.23%). LRU's decisions do not use features, so in that direction this residual cannot come from modelled features. Upgrade misses and L2 accesses (priority → LRU) match within about 1.5 k. |
+
+#### The correction (`model_permissions`, opt-in)
+
+| Rule | Model |
+|---|---|
+| Fill state | A read fill is S with a counterfactual holder, else the L3 state. A shadow fill at the recorded fill keeps the recorded state unless the counterfactual and the recorded run differ in whether another core held the line. |
+| L3 state | Inferred from the recorded history: M after any write (L2 store, readex or L1 store record); clean after a back-invalidation; as shown by the last recorded read fill without sharers. Clean without evidence (pre-ROI writes are not traced); the default never mattered (all 11.7 k first observations were clean, and only 16-262 inferences per replay used it). |
+| Own state | A shadow copy whose residency differs from the recorded copy's keeps its own state, maintained by the existing coherence rules. A write by the core that both runs perform makes both copies M with hint 1 again (re-synchronisation). |
+| L1 permission | A recorded L1-D write hit (an L1 store record that does not complete the core's own preceding L2 access) on a counterfactual copy that is not M is an L2 store upgrade (`l1_write_upgrades`). A recorded L2 store on a counterfactual M copy is a hit (`own_state_store_hits`). |
+
+* **Self-replays:** exact on all four Ocean traces and all 14 smoke traces. Every new must-be-zero counter is 0:
+  differing fill states, inferred L3 states, refetches of kept lines, own-state hits, L1-write upgrades.
+* **Tests:** three hand-worked examples (`ShadowPermissionTests`): a counterfactual sharer turns an L1 write hit into
+  an upgrade; no counterfactual sharer (dirty L3) turns an upgrade into a hit; a back-invalidation leaves the L3 copy
+  clean. The existing self-replay test also runs with the model on. 23 tests pass.
+* **The default is unchanged:** with `model_permissions` off, the archived cross-replays are reproduced counter for
+  counter.
+
+#### Breakdown of the upgrade-miss discrepancy
+
+* **LRU trace → priority:** the model now removes 11.2-12.0 k recorded S → M upgrades as own-state hits; 12.3 k fewer
+  upgrades were recorded under priority.
+  * 86-89% are "shadow fill at a recorded hit": priority evicted the S copy, the next access refilled it, no other
+    core held it any more, and the dirty L3 granted M, so the write that followed was an L1 hit instead of an
+    upgrade.
+  * 11-14% are "fill: no counterfactual sharer": a fill at the recorded fill, where the recorded run had a sharer
+    and the counterfactual had none.
+  * Cores 0-3: 23 / 31 / 34 / 12% (r1). Most occur within 1,000 records of the divergence.
+  * Upgrade misses predicted 244.2 k vs 243.4-243.8 k recorded (+0.2-0.3%; legacy +4.8-5.2%).
+* **Priority trace → LRU:** the model adds 11.2-11.3 k upgrades from recorded L1 write hits.
+  * 80-82% are "recorded copy dropped, shadow kept": priority dropped its S copy and refetched the line in M, while
+    LRU kept the S copy, which needs an upgrade.
+  * 12-13% are "fill: counterfactual sharer"; 6-8% are "shadow fill at a recorded hit".
+  * Upgrade misses predicted 255.0-255.5 k vs 255.7-256.6 k recorded (−0.3-0.4%; legacy −4.5-5.0%).
+* **What is involved:** every changed upgrade is on a copy whose state the model reconstructs (none on a synced copy).
+  None involves a phantom fill, so L1 inclusion plays no part; the counterfactual sharer set (coherence) and the L3's
+  dirty state do.
+* **Recorded run, independent of the model:** priority records 12.3 k fewer upgrade misses than LRU, which is about 9%
+  of its 137 k (r1, r1) miss reduction. This is a coherence channel of the class preference: evicting S copies
+  leaves later refetches without sharers, so they are granted M and their writes stay in the L1.
+
+#### Recomputed predictions (development data, NOT a calibration)
+
+| Pair (LRU, priority) | Measured | From the LRU trace (error; legacy) | From the priority trace (error; legacy) |
+|---|---|---|---|
+| r1, r1 | −2.301% | −2.206% (+0.096; +0.301) | −2.115% (+0.187; +0.371) |
+| r1, r2 | −2.397% | −2.206% (+0.191; +0.396) | −2.076% (+0.321; +0.508) |
+| r2, r1 | −2.227% | −2.201% (+0.026; +0.243) | −2.115% (+0.112; +0.297) |
+| r2, r2 | −2.323% | −2.201% (+0.121; +0.339) | −2.076% (+0.247; +0.433) |
+
+* **These four traces were used to find and build the correction, so the table is a development check.** All eight
+  errors are now within ±0.5 points, but **the model is not calibrated**. Only runs not used in its development can
+  calibrate it.
+* All eight errors are still positive (mean +0.16 points; +0.11 from the LRU traces, +0.22 from the priority
+  traces). The remaining bias is the demand-miss residual (D).
+* **Cost of the correction:** candidates with modelled features rise from 8.7-9.2% to 13.4-14.2% of decisions.
+* **L3-state bounds** (every inferred L3 state forced dirty / clean, to bound class C(1)):
+
+  | Prediction from | Errors, all inferred states dirty | Errors, all inferred states clean |
+  |---|---|---|
+  | LRU traces | −0.11 to +0.05 | +0.28 to +0.43 |
+  | Priority traces | unchanged (every inference was already dirty) | −0.92 to −1.08 |
+
+  The prediction therefore rests on the L3-state inference. "All clean" contradicts the recorded observations; the
+  history inference is exact within recorded holding periods (C(1)).
+* **Sensitivity variants** (`devcheck-*.txt`, errors over the four pairs):
+
+  | Variant | From the LRU traces | From the priority traces |
+  |---|---|---|
+  | Full permission model | +0.03 to +0.19 | +0.11 to +0.32 |
+  | No inclusion model | −0.26 to −0.42 | +0.12 to +0.35 |
+  | No coherence model | −0.03 to +0.13 | +0.07 to +0.30 |
+  | Neither | −0.32 to −0.48 | +0.07 to +0.32 |
+
+  * Inclusion modelling still moves the LRU-trace predictions by about 0.45 points, as before.
+  * Mechanism counts (pair r1, r1, predicted vs recorded): accesses +0.09% / −0.00%; upgrade misses +0.32% / −0.29%;
+    decisions +0.07% / −0.18%; coherence invalidations +0.82% / −0.39%; inclusion victims −0.73% / +1.06%; dirty
+    evictions +0.21% / −0.30%.
+
+#### What remains trustworthy without a calibrated counterfactual model
+
+* **Recorded runs:**
+  * their tallies, and the diagnostics above: stores by state, L1 write hits, L3 states observed at fills without
+    sharers;
+  * priority's lower upgrade-miss count, an observation.
+* **Window labels (concept A)** as descriptive statistics of each recorded run: agreement with the window's hindsight
+  choice, and dead victims. Pairwise label statistics, as a description of what each run's own future favoured.
+  * Neither is a miss reduction any policy could achieve.
+  * The labels use the recorded stream, which itself depends on the recorded policy.
+* **Not trustworthy until a held-out calibration passes:**
+  * any miss prediction for another policy;
+  * any ranking of fixed class orders;
+  * oracle headroom in misses.
+  * Even after a pass, policies far from LRU and priority (oracles, the whole-set optimum) rest on more modelled
+    state than the calibration tests.
+
+### 7.8 Recommendation (for review; nothing launched)
+
+**Option A, with a hard stop.** The correction follows from Sniper's code, keeps self-replays exact, matches the
+counts it targets (upgrade misses within 0.5%), and merits **one** held-out calibration.
+
+**Pre-registered held-out calibration** (each step gated on approval):
+* The model is frozen at the reviewed commit: `--model-permissions`, `l3_mode` history, window 4.
+* New traced Ocean `small` runs, every set: LRU ×2 and `rl-n4-prio` ×2, with the binary and configuration of
+  section 7.6, never replayed during development. Cost: about 25-35 minutes of wall time at 2 concurrent runs, plus
+  about 1 hour offline.
+* Criteria are unchanged from 7.2:
+  * self-replays exact (including the permission counters);
+  * null pairs ≤ 0.25 points;
+  * all eight predictions within ±0.5 points.
+* **If it fails, stop developing the model (option B)** and use direct Sniper experiments. No second round of
+  corrections fitted to the held-out runs.
+* **If it passes,** the shadow becomes a screening tool only:
+  * Fixed class orders (B) can be screened.
+  * Differences under about 0.5 points cannot be resolved.
+  * Every candidate is confirmed in Sniper.
+  * Oracle and whole-set analyses remain indicative references, not bounds.
+
+**Risk:** the development errors still lean the same way: mean +0.16 points, at most +0.32. With a noise floor of
+0.10, a held-out prediction from a priority trace could exceed +0.5. The L3-state inference carries a large lever
+(the clean bound moves priority-trace predictions by about 1.2 points), though the recorded data support the
+history inference.
+
+**Value for the project goal (coherence-aware replacement):**
+* The investigation's durable result is mechanistic and comes from the recorded runs: about 9% of priority's miss
+  reduction on Ocean comes through coherence permissions.
+  * Evicting S copies leaves later refetches without sharers, so the dirty L3 grants M and writes stay in the L1.
+  * This is an argument for sharing- and state-aware features that a design can use whether or not the shadow
+    passes.
+* The offline model is only worth more effort if a single held-out round passes. A larger redesign (a counterfactual
+  L3, or L1 contents) is not justified by what it could resolve at ±0.5 points (option C is not recommended).

@@ -236,7 +236,7 @@ def cmd_calibrate(args):
         verdict = f'DEVELOPMENT CHECK ONLY (would be {verdict.split(" ")[0]} on held-out runs; these traces were used to develop the model)'
     print(f'== RESULT: self-replays {"exact" if exact else "NOT exact"}; prediction errors {eL:+.3f} / {eP:+.3f} points (threshold ±{thr}); '
           f'sampling difference {meas_s - meas_all:+.3f} points; noise floor {max(noise) if noise else float("nan"):.3f} points '
-          f'-> CALIBRATION {verdict}')
+          f'-> {verdict if args.development_data else "CALIBRATION " + verdict}')
     if verdict != 'PASS':
         print('   The shadow model must not be used to rank replacement preferences (docs/rl/HEADROOM.md, "If calibration fails").')
     if args.development_data:
