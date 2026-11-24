@@ -14,6 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import calibration_summary as CS  # noqa: E402
 import labels as L  # noqa: E402
 import rltrace as R  # noqa: E402
 import shadow as S  # noqa: E402
@@ -477,6 +478,34 @@ class LabelTests(unittest.TestCase):
         use = lab.future.next_use(0, A, i)
         self.assertEqual(lab.distance(0, 0, i, use), 2)  # B, B between the decision and A's return
         self.assertIsNone(lab.distance(0, 0, i, S.INF))
+
+
+class CalibrationSummaryParseTests(unittest.TestCase):
+    """The held-out summary's parsing defect (docs/rl/HEADROOM.md 7.9, erratum): headroom.py prints signed values with
+    '{:+.3f}', so a positive value starts with '+'. The frozen script's (-?[\\d.]+) dropped such null-pair lines."""
+
+    LINES = ['   /r/lru-r1 vs /r/lru-r2: sampled sets +0.165%  all sets +0.165%',
+             '   /r/prio-r1 vs /r/prio-r2: sampled sets -0.054%  all sets -0.054%',
+             '   measured priority vs LRU: sampled sets +0.120%   all sets -0.001%   (sampling difference +0.121 points)',
+             '   full model           from the LRU trace +0.300% (error +0.180)   from the priority trace -2.215% (error -0.054)',
+             '   upgrade_misses               255744     244212     243442    +0.32 |     255011    -0.29']
+
+    def test_null_pairs_with_either_sign_are_read(self):
+        out = CS.parse_lines(self.LINES)
+        self.assertEqual(out['null'], [(0.165, 0.165), (-0.054, -0.054)])
+        self.assertAlmostEqual(max(abs(a) for a, _ in out['null']), 0.165)
+
+    def test_other_signed_values_are_read(self):
+        out = CS.parse_lines(self.LINES)
+        self.assertEqual((out['measured'], out['measured_all']), (0.12, -0.001))
+        self.assertEqual(out['variants']['full model'], (0.3, 0.18, -2.215, -0.054))
+        self.assertEqual(out['mech']['upgrade_misses'], (255744, 244212, 243442, 255011, 0.32, -0.29))
+
+    def test_the_frozen_pattern_drops_a_positive_null(self):
+        frozen = r'   \S+ vs \S+: sampled sets (-?[\d.]+)%  all sets (-?[\d.]+)%'
+        import re
+        self.assertIsNone(re.match(frozen, self.LINES[0]))     # the defect, as frozen
+        self.assertIsNotNone(re.match(frozen, self.LINES[1]))  # negative values were read, so the dry run passed
 
 
 if __name__ == '__main__':

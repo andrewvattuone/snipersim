@@ -17,6 +17,13 @@
   * That is not a calibration: a held-out calibration is required before any use.
   * Recommendation ([section 7.8](#78-recommendation-for-review-nothing-launched)): one pre-registered held-out
     calibration, then stop if it fails.
+* **The held-out calibration PASSED** on 2026-11-23 ([section 7.9](#79-held-out-calibration-result-2026-11-23)):
+  * four new traced runs, with the model and criteria frozen before simulation;
+  * all eight errors within ±0.5 points, the largest 0.152;
+  * noise floor 0.165 points.
+
+  This holds for Ocean `small`, this configuration and LRU vs priority only. The shadow may be used for a limited
+  screening of fixed class rankings, and every promising ranking must be confirmed in Sniper.
 
 **Why:** the Stage 7 objective investigation (`results/stage7-objective-investigation/REPORT.md`) found that the
 rl_lru rewards are absolute per-block labels, not relative judgements. Before another learning redesign, we want to
@@ -255,7 +262,8 @@ traffic were uniform**.
 | `shadow.py` | Shadow model, policies (`lru`, `priority`, `order:<six classes>`, `opt-window`, `opt-set`), the `Future` index, additive class orders |
 | `labels.py` | Concept A labels of the recorded decisions |
 | `headroom.py` | CLI: `check`, `replay`, `labels`, `calibrate`, `orders`, `phase` |
-| `test_headroom.py` | Synthetic traces worked by hand |
+| `calibration_summary.py` | Summary and verdict of four calibrate outputs (section 7.9; the corrected held-out summary script) |
+| `test_headroom.py` | Synthetic traces worked by hand; 26 tests (section 7.9) |
 
 Every output starts with provenance lines:
 * the command;
@@ -720,3 +728,101 @@ history inference.
     passes.
 * The offline model is only worth more effort if a single held-out round passes. A larger redesign (a counterfactual
   L3, or L1 contents) is not justified by what it could resolve at ±0.5 points (option C is not recommended).
+
+### 7.9 Held-out calibration result (2026-11-23)
+
+**Setup.** The model, tools, criteria and decision rules were frozen at `54e00fdc` before any simulation (`FREEZE.txt`).
+* Four new traced Ocean `small` runs: LRU ×2 and `rl-n4-prio` ×2, every set traced.
+* Same binary (`25290da9`), configuration and runner as section 7.6.
+* `headroom.py calibrate --model-permissions`, without `--development-data`.
+* None of the development traces was used, including for the null pairs.
+
+**Provenance** (`results/stage7-headroom-heldout/`: REPORT.txt, PROVENANCE.txt, FREEZE.txt, PREFLIGHT.txt):
+* Binary `build/default/lib/sniper`: md5 `25290da9…`, sha256 `84213ac0…4bca56`. It is identical to
+  `results/stage7-headroom-trace.sniper-25290da9` and was not rebuilt; the C++ tree is unchanged since `7eff9503`.
+* Tool sha256 values (each calibrate output's header repeats them): `headroom.py` `9ddcc8c1…`, `shadow.py`
+  `69352406…`, `rltrace.py` `a65b12a6…`, `labels.py` `ff8514d6…`.
+* Workload and configuration:
+  * OCEAN md5 `4ce36666…`;
+  * 4-core gainestown, complete ROI, 8 MB L3, prefetchers off;
+  * `rl_trace` with `set_modulus=1`;
+  * commands as in section 7.6 apart from `-d`.
+* Run on 2026-11-23, 13:47–14:24, at most 2 concurrent runs.
+* Archive: `results/archive/stage7-headroom-heldout-20261123.tar.gz`, sha256 `b521d4d8…`, which includes the traces.
+
+**Validation** (VALIDATION.txt, from the unchanged `validate.py` of section 7.6):
+* All runs completed; 10/10 checker results passed.
+* Traces complete, with no cache records before the ROI.
+* Trace tallies equal `sim.stats` within the ROI-boundary window: 1–3 records in 6 and 10 per-core tallies of the two
+  priority runs.
+* Self-replays exact under both the legacy model (`validate.py`) and the permission model (calibrate), with 100%
+  same victims.
+* Total and demand misses fall within the spread of the earlier untraced runs.
+* Eight secondary counts fall just outside that spread, against six in section 7.6. The largest is coherence
+  invalidations at ±3%. These are not criteria.
+
+**Verdict: PASS.** Every pre-registered criterion is met, and `headroom.py` reports CALIBRATION PASS for each pair.
+
+| Pair (LRU, priority) | Measured | From LRU trace (error) | From priority trace (error) | Development errors (7.7) |
+|---|---|---|---|---|
+| r1, r1 | −2.161 | −2.009 (+0.152) | −2.215 (−0.054) | +0.096 / +0.187 |
+| r1, r2 | −2.108 | −2.009 (+0.099) | −2.157 (−0.049) | +0.191 / +0.321 |
+| r2, r1 | −2.322 | −2.181 (+0.141) | −2.215 (+0.107) | +0.026 / +0.112 |
+| r2, r2 | −2.270 | −2.181 (+0.088) | −2.157 (+0.113) | +0.121 / +0.247 |
+
+* **Noise floor:** the null pairs are +0.165 (LRU) and +0.054 (priority), so the floor is 0.165 points, against a
+  limit of 0.25.
+* **Sampling difference:** at most 0.001 points.
+* **Permission-counter consistency checks C1–C4:** all ok.
+  * Self-replay correction counters are 0.
+  * Trace-derived counters are identical in the self- and cross-replays of each trace.
+  * No observed L3 M was called clean by the history.
+
+**Remaining bias:**
+* From LRU traces, all four errors are positive (+0.088 to +0.152), as in development. The model still
+  under-predicts priority's benefit by about 0.1 point. It over-predicts priority's misses by +0.09 to +0.18%, almost
+  all of them demand misses.
+* From priority traces, the errors are mixed (−0.054 to +0.113, mean +0.029). In development they were +0.11 to +0.32.
+* Every error is below the noise floor. With two repetitions, a bias of about 0.1 point cannot be separated from
+  run-to-run variation.
+
+**Mechanism counts, predicted vs recorded:**
+
+| Count | LRU→priority | priority→LRU |
+|---|---|---|
+| Total misses | +0.09 to +0.16% | −0.12 to +0.06% |
+| Upgrade misses (first calibration about ±5%) | −0.61 to +0.14% | −0.62 to +0.43% |
+| L2 accesses | +0.07 to +0.18% | −0.07 to +0.01% |
+| Inclusion victims | −2.0 to +1.1% | +0.7 to +1.8% |
+| Dirty evictions | −0.05 to +0.48% | −0.41 to +0.25% |
+| Modelled candidates | 13.3–13.4% | 14.2% |
+
+* **L3-state inference:** 0.5% of inferences (LRU→priority) and 0.01% (priority→LRU) had no history to go on.
+* **Observed L3 disagreement:** 12.2–13.1%, all of it stale dirty, as in development.
+
+**Erratum.** The frozen summary script read null-pair values with a regex that rejects a leading `+`. Both
+development nulls were negative, so the dry run did not catch it. Here both nulls are positive, so the script printed
+INCONCLUSIVE (noise floor nan).
+* The frozen script (`scripts/summarize_heldout.py`, sha256 `915b404b…`) and its output (`HELDOUT-SUMMARY.txt`) are
+  kept unchanged.
+* `scripts/summarize_heldout_errata.py` differs from it by that one regex. Its output (`HELDOUT-SUMMARY-ERRATA.txt`)
+  gives PASS. The null values appear verbatim in all four calibrate outputs, and `headroom.py`'s own floor is 0.165.
+* No criterion, threshold or model changed.
+* **Reproducible corrected calculation:**
+  * `experiments/rl/headroom/calibration_summary.py` is the summary script with every signed value read with one
+    pattern, `SIGNED`. Its output on the held-out directory is byte-identical to `HELDOUT-SUMMARY-ERRATA.txt`.
+  * `CalibrationSummaryParseTests` in `test_headroom.py` covers positive and negative values. It also shows that the
+    frozen pattern rejects a positive null and accepts a negative one, which is why the dry run passed.
+* **Independent check:** `results/stage7-heldout-verdict-verification/` (`scripts/verify_verdict.py` →
+  `VERIFY-VERDICT.txt`) recomputes the measured differences, the eight errors and the two nulls from the raw recorded
+  and predicted miss counts. It gets noise floor 0.1651 and largest |error| 0.1521, so PASS on both criteria.
+
+**What it does and does not establish:**
+* Exact self-replay shows that the replay is correct. Cross-policy accuracy is a separate, counterfactual claim, and it
+  holds here within the noise floor.
+* The validation covers one workload, one configuration, one policy pair and two repetitions. It is not a general
+  validation.
+* As pre-specified, the only use it supports is a limited offline screening of fixed MESI and sharing class
+  rankings. Differences under about 0.5 points cannot be resolved, and every promising ranking must be verified
+  directly in Sniper.
+* Nothing further was launched. The project's next priority is direct work on the replacement algorithm in Sniper.
