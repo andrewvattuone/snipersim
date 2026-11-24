@@ -137,6 +137,18 @@ WORKLOADS = {
                          sniper=['-s', 'stop-by-icount:500000000']),                          # 1,720 s
     'capb-km-500m': dict(cmd=CB('km', 'paper'), roi=True, input='paper', roi_end='instruction-limit', timeout=3600,
                          sniper=['-s', 'stop-by-icount:500000000']),                          # 624 s
+    # FAST and GF qualification (results/stage6-fastgf-qual): paper inputs (8192 x 8192 image; GF 11 x 11 mask), first
+    # 250 M ROI instructions. The ~64 M-pixel random-image initialization is fast-forwarded (--no-cache-warming): the
+    # 64 MB image exceeds the L3, and each thread's rows are untouched since initialization, so warming changes little.
+    'capb-fast-250m': dict(cmd=CB('fast', 'standard'), roi=True, input='paper', roi_end='instruction-limit',
+                           timeout=3000, sniper=['-s', 'stop-by-icount:250000000', '--no-cache-warming']),
+    'capb-gf-250m': dict(cmd=CB('gf', 'standard'), roi=True, input='paper', roi_end='instruction-limit',
+                         timeout=3000, sniper=['-s', 'stop-by-icount:250000000', '--no-cache-warming']),
+    # The same, first 500 M ROI instructions: at 250 M the cold L2s had barely filled (FAST 6, GF 111 replacements)
+    'capb-fast-500m': dict(cmd=CB('fast', 'standard'), roi=True, input='paper', roi_end='instruction-limit',
+                           timeout=3000, sniper=['-s', 'stop-by-icount:500000000', '--no-cache-warming']),
+    'capb-gf-500m': dict(cmd=CB('gf', 'standard'), roi=True, input='paper', roi_end='instruction-limit',
+                         timeout=3000, sniper=['-s', 'stop-by-icount:500000000', '--no-cache-warming']),
     # Paper input, two complete K-Means iterations in detail (1.78 G + 1.77 G), with a statistics snapshot at the start
     # of iteration 2; `measure` is iteration 2 alone (warm caches, reuse of the points). Initialization (7 M) is
     # fast-forwarded. Not measured: ~0.84 MIPS (capb-km-500m) -> ~4,200 s.
